@@ -37,7 +37,9 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
+    _ = @import("xing_hc.zig");
     _ = @import("xing4_fixture_test.zig");
+    _ = @import("mla.zig");
     _ = @import("kokoro.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");

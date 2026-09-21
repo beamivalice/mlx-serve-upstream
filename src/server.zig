@@ -3450,9 +3450,9 @@ pub fn prefillTransientReserveAtKv(
     return prefillMemoryNeeded(
         seq,
         config.num_attention_heads,
-        config.num_key_value_heads,
+        config.kvCacheHeads(),
         0,
-        config.head_dim,
+        config.kvCacheHeadDim(),
         config.prefillScoreHeadDim(),
         config.hidden_size,
         prefillFfnWidth(config),
@@ -3461,7 +3461,14 @@ pub fn prefillTransientReserveAtKv(
         config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-        .{ .qsa_ring_bytes = config.qsaRingBytes(), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
+        .{
+            .qsa_ring_bytes = config.qsaRingBytes(),
+            .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits),
+            .kv_dequant_bytes_per_token = kvDequantBytesPerToken(config),
+            .kv_cast_bytes_per_token = kvF32BankBytesPerToken(config),
+            .score_bytes_per_head = xingMlaScoreBytesPerHead(config),
+            .score_mask_bytes = xingMlaScoreMaskBytes(config),
+        },
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
@@ -5112,6 +5119,20 @@ pub const PrefillRequestTerms = struct {
     mtp_head_kv_bytes: u64 = 0,
     /// Forward width from which the dequant+GEMM route fires (`prefillDqGemmMinRows`).
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
+    /// Dense BF16 bytes per token for the one layer's stored K+V rows that a
+    /// quantized-KV prefill dequantizes. Zero keeps the legacy positional
+    /// formula for direct callers that do not have a ModelConfig.
+    kv_dequant_bytes_per_token: u64 = 0,
+    /// Dense F32 bytes per token for a runtime cast of the stored K+V bank.
+    /// Zero on every path except the temporary Xing latent attention baseline,
+    /// which casts its bank even when the cache itself is dense.
+    kv_cast_bytes_per_token: u64 = 0,
+    /// Explicit materialized score bytes per `[head, query, key]`. Null uses
+    /// the legacy fused-kernel policy; an override always bills its sheets.
+    score_bytes_per_head: ?u64 = null,
+    /// Extra per-query/key bytes for an explicit causal mask. Zero is the
+    /// legacy fused/unfused score contract; Xing's baseline keeps one bool.
+    score_mask_bytes: u64 = 0,
 };
 
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
@@ -5122,8 +5143,19 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // (live 2026-07-14). No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
-    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
-    const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
+    const score_cells: u64 = fwd * @min(attn_keys, seq);
+    const scores: u64 = if (req.score_bytes_per_head) |bytes|
+        heads * score_cells * bytes
+    else if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim)))
+        heads * score_cells * 2
+    else
+        0;
+    const dequant_per_token = if (req.kv_dequant_bytes_per_token > 0)
+        req.kv_dequant_bytes_per_token
+    else
+        2 * kv_heads * hdim * 2;
+    const dequant: u64 = if (kv_bits < 16) seq * dequant_per_token else 0;
+    const kv_cast: u64 = seq * req.kv_cast_bytes_per_token;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     // The MLP envelope alone is not the whole per-token working set: an arch
     // with its own prefill streams (linear-attention layers, MoE gather-sort
@@ -5140,7 +5172,9 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // already dominates.
     const dq_weights: u64 = if (fwd >= req.dq_min_rows) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes +
+        scores + score_cells * req.score_mask_bytes +
+        dequant + kv_cast + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
@@ -5193,7 +5227,7 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
 /// an owned copy evaluated at each cadence point, older layers' chunk inputs are
 /// released inside the loop (the old all-layers figure WAS that pin).
 ///
-/// Attention-only archs return 0 and keep exactly the bill they had.
+/// Other attention-only archs return 0 and keep exactly the bill they had.
 fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     var per_tok: u64 = 0;
     const linear_layers: u64 = @as(u64, config.num_hidden_layers) -| config.attnCacheLayerCount();
@@ -5212,8 +5246,48 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
         // Both sublayers retain a BF16 stream product and an f32 norm
         // until the next eval-cadence boundary.
         per_tok += MOE_PREFILL_COEXIST * 2 * @as(u64, config.xing_hc_mult) * config.hidden_size * (2 + 4);
+        per_tok += xingMlaSmallWorkingBytesPerQuery(config);
     }
     return per_tok;
+}
+
+/// Dense BF16 bytes of one caching layer's physical K+V rows. The latent Xing
+/// arm is asymmetric (64-wide K + 512-wide V), so `2 * head_dim` would
+/// overstate the dequant staging and disagree with the cache geometry.
+fn kvDequantBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    // Keep the established non-Xing prefill bill unchanged. Xing's own cache
+    // geometry is physical K+V, including the expanded A/B arm.
+    if (config.isXing4()) {
+        return @as(u64, config.kvCacheHeads()) * @as(u64, config.kvCacheWidthSum()) * 2;
+    }
+    return 2 * @as(u64, config.num_key_value_heads) * config.head_dim * 2;
+}
+
+/// Dense F32 bytes of the Xing latent K/V bank cast that attention consumes.
+/// This is live for dense and quantized KV; quantized KV additionally pays the
+/// BF16 dequant buffer from `kvDequantBytesPerToken`.
+fn kvF32BankBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    if (!config.isXing4() or !config.mla_latent_kv) return 0;
+    return @as(u64, config.kvCacheHeads()) * @as(u64, config.kvCacheWidthSum()) * 4;
+}
+
+/// Per-query F32 tensors retained by the temporary native Xing MLA baseline:
+/// q_nope, q_rope, q_latent, attended_latent, and projected value.
+fn xingMlaSmallWorkingBytesPerQuery(config: *const model_mod.ModelConfig) u64 {
+    if (!config.isXing4() or !config.mla_latent_kv) return 0;
+    const q_dims: u64 = @as(u64, config.mla_qk_nope_head_dim) +
+        config.mla_qk_rope_head_dim +
+        2 * @as(u64, config.mla_kv_lora_rank) +
+        config.mla_v_head_dim;
+    return 4 * @as(u64, config.num_attention_heads) * q_dims;
+}
+
+fn xingMlaScoreBytesPerHead(config: *const model_mod.ModelConfig) ?u64 {
+    return if (config.isXing4() and config.mla_latent_kv) 12 else null;
+}
+
+fn xingMlaScoreMaskBytes(config: *const model_mod.ModelConfig) u64 {
+    return if (config.isXing4() and config.mla_latent_kv) 1 else 0;
 }
 
 /// The dequantized-weight working set `transformer.prefillDqGemm` materializes
@@ -5338,7 +5412,17 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // allocator twin is gated too, so an ungated guard billed memory never reserved). `.{}` is
     // the identity: `prefillMemoryNeeded` then reduces to the previous expression.
     const dq_min_rows: u64 = transformer_mod.prefillDqGemmMinRows(config.quant_bits);
-    if (!config.longCtxGated()) return .{ .dq_min_rows = dq_min_rows };
+    const kv_dequant_bytes_per_token = kvDequantBytesPerToken(config);
+    const kv_cast_bytes_per_token = kvF32BankBytesPerToken(config);
+    const score_bytes_per_head = xingMlaScoreBytesPerHead(config);
+    const score_mask_bytes = xingMlaScoreMaskBytes(config);
+    if (!config.longCtxGated()) return .{
+        .dq_min_rows = dq_min_rows,
+        .kv_dequant_bytes_per_token = kv_dequant_bytes_per_token,
+        .kv_cast_bytes_per_token = kv_cast_bytes_per_token,
+        .score_bytes_per_head = score_bytes_per_head,
+        .score_mask_bytes = score_mask_bytes,
+    };
     // `reservedTokens` returns 0 below its length threshold; floor the reserved length at `seq`.
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
@@ -5360,6 +5444,10 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .qsa_ring_bytes = config.qsaRingBytes() +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
+        .kv_dequant_bytes_per_token = kv_dequant_bytes_per_token,
+        .kv_cast_bytes_per_token = kv_cast_bytes_per_token,
+        .score_bytes_per_head = score_bytes_per_head,
+        .score_mask_bytes = score_mask_bytes,
     };
 }
 
@@ -5592,8 +5680,8 @@ pub fn prefillNeededAtChunk(
     const is_dsv4: bool = std.mem.eql(u8, config.model_type, "deepseek_v4") and config.dsv4_n_compress_ratios > 0;
     const heads: u64 = config.num_attention_heads;
     const layers: u64 = config.num_hidden_layers;
-    const kv_heads: u64 = config.num_key_value_heads;
-    const hdim: u64 = config.head_dim;
+    const kv_heads: u64 = config.kvCacheHeads();
+    const hdim: u64 = config.kvCacheHeadDim();
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
@@ -21742,6 +21830,196 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
     gdn.full_attention_interval = 4;
     try t.expectEqual(@as(u32, 10), gdn.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 10 * 2 * 512 * 2), gdn.kvBytesPerToken());
+}
+
+test "Xing latent KV accounting preserves BF16, 8-bit, and 4-bit widths" {
+    const t = std.testing;
+    var latent = model_mod.ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .num_hidden_layers = 40,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 32,
+        .head_dim = 192,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 128,
+        .mla_qk_rope_head_dim = 64,
+        .mla_v_head_dim = 128,
+        .mla_latent_kv = true,
+    };
+    const dense: u64 = 40 * 1 * (512 + 64) * 2;
+    try t.expectEqual(dense, latent.kvBytesPerToken());
+    try t.expectEqual(dense, kvBytesPerTokenAtBits(latent.kvBytesPerToken(), 16));
+    try t.expectEqual(dense * 17 / 32, kvBytesPerTokenAtBits(latent.kvBytesPerToken(), 8));
+    try t.expectEqual(dense * 9 / 32, kvBytesPerTokenAtBits(latent.kvBytesPerToken(), 4));
+
+    var expanded = latent;
+    expanded.mla_latent_kv = false;
+    const expanded_dense: u64 = 40 * 32 * (192 + 128) * 2;
+    try t.expectEqual(expanded_dense, expanded.kvBytesPerToken());
+    try t.expectEqual(expanded_dense * 17 / 32, kvBytesPerTokenAtBits(expanded.kvBytesPerToken(), 8));
+    try t.expectEqual(expanded_dense * 9 / 32, kvBytesPerTokenAtBits(expanded.kvBytesPerToken(), 4));
+
+    // Original non-Xing GQA remains unchanged.
+    var gqa = model_mod.ModelConfig{
+        .model_type = "qwen3",
+        .num_hidden_layers = 24,
+        .num_key_value_heads = 8,
+        .head_dim = 128,
+    };
+    const gqa_dense: u64 = 24 * 8 * 256 * 2;
+    try t.expectEqual(gqa_dense, gqa.kvBytesPerToken());
+    try t.expectEqual(gqa_dense * 17 / 32, kvBytesPerTokenAtBits(gqa.kvBytesPerToken(), 8));
+    try t.expectEqual(gqa_dense * 9 / 32, kvBytesPerTokenAtBits(gqa.kvBytesPerToken(), 4));
+}
+
+test "prefillMemoryNeeded uses exact latent K+V width for quantized dequant staging" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .num_hidden_layers = 40,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 32,
+        .head_dim = 192,
+        .hidden_size = 3584,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 128,
+        .mla_qk_rope_head_dim = 64,
+        .mla_v_head_dim = 128,
+        .mla_latent_kv = true,
+    };
+    const seq: u64 = 10_000;
+    const dequant_per_token = @as(u64, cfg.kvCacheHeads()) * cfg.kvCacheWidthSum() * 2;
+    const exact = PrefillRequestTerms{ .kv_dequant_bytes_per_token = dequant_per_token };
+    const legacy = PrefillRequestTerms{};
+    const exact_bill = prefillMemoryNeeded(
+        seq,
+        cfg.num_attention_heads,
+        cfg.kvCacheHeads(),
+        cfg.kvBytesPerToken(),
+        cfg.kvCacheHeadDim(),
+        cfg.prefillScoreHeadDim(),
+        cfg.hidden_size,
+        prefillFfnWidth(&cfg),
+        8,
+        1024,
+        seq,
+        0,
+        0,
+        exact,
+    );
+    const legacy_bill = prefillMemoryNeeded(
+        seq,
+        cfg.num_attention_heads,
+        cfg.kvCacheHeads(),
+        cfg.kvBytesPerToken(),
+        cfg.kvCacheHeadDim(),
+        cfg.prefillScoreHeadDim(),
+        cfg.hidden_size,
+        prefillFfnWidth(&cfg),
+        8,
+        1024,
+        seq,
+        0,
+        0,
+        legacy,
+    );
+    const legacy_dequant_per_token = @as(u64, 2) * cfg.kvCacheHeads() * cfg.kvCacheHeadDim() * 2;
+    try t.expectEqual(seq * (legacy_dequant_per_token - dequant_per_token) * 5 / 4, legacy_bill - exact_bill);
+}
+
+test "Xing latent score sheets are billed even at stock fused head widths" {
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    for ([_]u32{ 128, 256, 576 }) |width| {
+        const cfg = model_mod.ModelConfig{
+            .model_type = "xing4_0",
+            .xing_hc = true,
+            .mla_latent_kv = true,
+            .num_hidden_layers = 1,
+            .num_attention_heads = 4,
+            .num_key_value_heads = 4,
+            .hidden_size = 64,
+            .head_dim = 192,
+            .mla_kv_lora_rank = width - 64,
+            .mla_qk_rope_head_dim = 64,
+            .mla_qk_nope_head_dim = 128,
+            .mla_v_head_dim = 128,
+        };
+        const terms = prefillRequestTerms(&cfg, 8192, 256, 16, 512, .{});
+        var without_scores = terms;
+        without_scores.score_bytes_per_head = 0;
+        const with = prefillMemoryNeeded(8192, 4, 1, cfg.kvBytesPerToken(), cfg.kvCacheHeadDim(), cfg.prefillScoreHeadDim(), 64, 64, 16, 512, 8192, 0, 0, terms);
+        const without = prefillMemoryNeeded(8192, 4, 1, cfg.kvBytesPerToken(), cfg.kvCacheHeadDim(), cfg.prefillScoreHeadDim(), 64, 64, 16, 512, 8192, 0, 0, without_scores);
+        try std.testing.expectEqual(@as(u64, 4 * 512 * 8192 * 12 * 5 / 4), with - without);
+    }
+}
+
+test "Xing latent prefill bill accounts for F32 MLA sheets and bank casts" {
+    const t = std.testing;
+    transformer_mod.fused256_override = false;
+    defer transformer_mod.fused256_override = null;
+
+    var cfg = model_mod.ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .num_hidden_layers = 40,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 32,
+        .head_dim = 192,
+        .hidden_size = 3584,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 128,
+        .mla_qk_rope_head_dim = 64,
+        .mla_v_head_dim = 128,
+        .mla_latent_kv = true,
+    };
+
+    const seq: u64 = 8192;
+    const chunk: u64 = 1024;
+    const terms = prefillRequestTerms(&cfg, seq, 256, 16, chunk, .{});
+    try t.expectEqual(@as(u64, 12), terms.score_bytes_per_head);
+    try t.expectEqual(@as(u64, 1), terms.score_mask_bytes);
+    try t.expectEqual(@as(u64, 576 * 2), terms.kv_dequant_bytes_per_token);
+    try t.expectEqual(@as(u64, 576 * 4), terms.kv_cast_bytes_per_token);
+
+    // The native baseline keeps three F32 [H,Q,T] sheets plus one bool mask,
+    // replacing the generic two-byte score sheet rather than adding to it.
+    const legacy_terms = PrefillRequestTerms{
+        .kv_dequant_bytes_per_token = terms.kv_dequant_bytes_per_token,
+    };
+    const common = .{
+        seq,
+        @as(u64, cfg.num_attention_heads),
+        @as(u64, cfg.kvCacheHeads()),
+        cfg.kvBytesPerToken(),
+        @as(u64, cfg.kvCacheHeadDim()),
+        @as(u64, cfg.prefillScoreHeadDim()),
+        @as(u64, cfg.hidden_size),
+        prefillFfnWidth(&cfg),
+        @as(u64, 16),
+        chunk,
+        seq,
+        @as(u64, 0),
+        @as(u64, 0),
+    };
+    const legacy = prefillMemoryNeeded(common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8], common[9], common[10], common[11], common[12], legacy_terms);
+    const native = prefillMemoryNeeded(common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8], common[9], common[10], common[11], common[12], terms);
+    const score_delta = ((12 * @as(u64, cfg.num_attention_heads) + 1) - 2 * @as(u64, cfg.num_attention_heads)) * chunk * seq;
+    const bank_cast = seq * 576 * 4;
+    try t.expectEqual((score_delta + bank_cast) * 5 / 4, native - legacy);
+
+    const small = xingMlaSmallWorkingBytesPerQuery(&cfg);
+    var expanded = cfg;
+    expanded.mla_latent_kv = false;
+    try t.expectEqual(
+        @as(u64, 4) * cfg.num_attention_heads *
+            (cfg.mla_qk_nope_head_dim + cfg.mla_qk_rope_head_dim +
+                2 * cfg.mla_kv_lora_rank + cfg.mla_v_head_dim),
+        small,
+    );
+    try t.expectEqual(small, prefillStreamBytesPerToken(&cfg) - prefillStreamBytesPerToken(&expanded));
 }
 
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {

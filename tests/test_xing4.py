@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the original Xing BF16 checkpoint through a real native server.
+"""Exercise an original BF16 or mixed-affine Xing checkpoint through a real server.
 
 python3 tests/test_xing4.py /path/to/Xing4.0-29B-A4B
 Build the binary with zig build -Doptimize=ReleaseFast first.
@@ -123,7 +123,7 @@ def main():
                 except (OSError, AssertionError):
                     assert time.monotonic() < deadline, "server readiness timeout"
                     time.sleep(0.2)
-            record("load-original-bf16", request("/v1/load-model", {"model": str(model)}))
+            record("load-checkpoint", request("/v1/load-model", {"model": str(model)}))
             rows = request("/v1/models")["data"]
             row = next(row for row in rows if row["id"] == model.name)
             assert row["context_length"] == 4096, row
@@ -207,7 +207,7 @@ def main():
             log = log_path.read_text()
             assert "[dtype-trace] residual widened" not in log, "residual widened; inspect server.log"
             assert "jinja error:" not in log, "template fallback; inspect server.log"
-            print(f"All Xing BF16 API checks passed. Artifacts: {root}", flush=True)
+            print(f"All Xing API checks passed. Artifacts: {root}", flush=True)
         finally:
             server.terminate()
             try:

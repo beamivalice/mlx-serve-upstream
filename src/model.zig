@@ -247,6 +247,11 @@ pub const ModelConfig = struct {
     mla_qk_rope_head_dim: u32 = 0,
     mla_v_head_dim: u32 = 0,
     mla_head_gate: bool = false,
+    /// Xing's native cache stores one compressed K/V latent row: the rotated
+    /// K slice plus the normalized KV latent as V. Other MLA archs keep the
+    /// expanded per-head K/V cache. This is a runtime layout choice, not a
+    /// checkpoint property; `MLX_SERVE_MLA_LATENT=0` selects the expanded A/B.
+    mla_latent_kv: bool = false,
     // RoPE rotates ADJACENT PAIRS (x[2i], x[2i+1]) instead of halves — mlx's
     // `traditional` rope. Set by rope_interleave.
     rope_interleaved_pairs: bool = false,
@@ -799,12 +804,6 @@ pub const ModelConfig = struct {
         return n;
     }
 
-    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
-    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
-    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
-    /// at all, and MLA's key (nope+rope) is WIDER than its value. Every
-    /// memory estimate that sizes a KV cache reads this one helper so the
-    /// auto-context sizer and the prefill admission guard cannot disagree.
     /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
     /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
     /// prompt to a narrow rung.
@@ -812,24 +811,55 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
+    /// Number of head rows physically stored by one caching attention layer.
+    /// Expanded MLA is broadcast to every query head; Xing's latent arm keeps
+    /// one compressed row instead. Plain attention keeps its configured KV
+    /// grouping.
+    pub fn kvCacheHeads(self: *const ModelConfig) u32 {
+        if (self.isMla()) {
+            return if (self.mla_latent_kv) 1 else self.num_attention_heads;
+        }
+        return self.num_key_value_heads;
+    }
+
+    /// Largest physical K/V width stored by one cache row. This is a safe
+    /// maximum for callers that need one rectangular staging width; use
+    /// `kvCacheWidthSum` when pricing the exact asymmetric K+V allocation.
+    pub fn kvCacheHeadDim(self: *const ModelConfig) u32 {
+        if (!self.isMla()) return self.head_dim;
+        const key_width = if (self.mla_latent_kv)
+            self.mla_qk_rope_head_dim
+        else
+            self.mlaQkHeadDim();
+        return @max(key_width, self.mla_v_head_dimOrLatent());
+    }
+
+    /// Exact K+V element width in one stored cache row. Xing latent K is only
+    /// the rotated slice; its V row is the normalized KV latent. Expanded MLA
+    /// retains the full non-positional+rotary K and the value head.
+    pub fn kvCacheWidthSum(self: *const ModelConfig) u32 {
+        if (!self.isMla()) return 2 * self.head_dim;
+        const key_width = if (self.mla_latent_kv)
+            self.mla_qk_rope_head_dim
+        else
+            self.mlaQkHeadDim();
+        return key_width + self.mla_v_head_dimOrLatent();
+    }
+
+    /// Dense (bf16) KV-cache bytes ONE token occupies across the whole model.
+    /// The uniform `layers × 2 × kv_heads × head_dim` formula is wrong on a
+    /// hybrid MLA arch in both terms: only `attnCacheLayerCount` layers cache
+    /// at all, and MLA's key (nope+rope) is WIDER than its value. The geometry
+    /// below is the same physical rows and K+V widths the cache allocates, so
+    /// compressed MLA does not inherit the expanded arm's 32-head bill.
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
-        const widths: u64 = if (self.isMla())
-            @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
-        else
-            2 * @as(u64, self.head_dim);
-        // MLA decompresses its latent to EVERY attention head before the write
-        // (`mlaAttnWith` broadcasts the MQA rope key to `num_attention_heads`
-        // and caches `[B, num_attention_heads, S, qk_dim]`), so its cache has
-        // no grouping to save on — `num_key_value_heads` is the GQA question
-        // and this arch never asks it. Equal on Ling 3.0 (16/16), so the
-        // spelling is invisible today and would UNDER-bill the first MLA
-        // checkpoint that groups — the direction that ends in an uncatchable
-        // Metal OOM rather than a 400.
-        const heads: u64 = if (self.isMla())
-            @as(u64, self.num_attention_heads)
-        else
-            @as(u64, self.num_key_value_heads);
-        return @as(u64, self.attnCacheLayerCount()) * heads * widths * 2;
+        return @as(u64, self.attnCacheLayerCount()) *
+            @as(u64, self.kvCacheHeads()) *
+            @as(u64, self.kvCacheWidthSum()) * 2;
+    }
+
+    fn mla_v_head_dimOrLatent(self: *const ModelConfig) u32 {
+        return if (self.mla_latent_kv) self.mla_kv_lora_rank else self.mla_v_head_dim;
     }
 
     /// Dense bf16 bytes of QSA indexer history ONE token occupies: the pooled
@@ -964,6 +994,14 @@ pub const ModelConfig = struct {
     /// Full MLA + MoE, with mHC residual streams around both sublayers.
     pub fn isXing4(self: *const ModelConfig) bool {
         return self.xing_hc and std.mem.eql(u8, self.model_type, "xing4_0");
+    }
+
+    /// SSD namespace for a cache layout that cannot restore into another
+    /// geometry. Null intentionally preserves the historical fingerprint for
+    /// every non-Xing model and for Xing's expanded A/B arm.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.isXing4() and self.mla_latent_kv) return "xing4-mla-latent-v1";
+        return null;
     }
 
     /// The long-context blast-radius predicate: every long-context mechanism (KV
@@ -1136,6 +1174,9 @@ pub const ModelConfig = struct {
     /// score budget that exists for exactly this materializing path never
     /// applies. A new arch scoring wider than it stores adds its arm here.
     pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        if (self.isMla() and self.mla_latent_kv) {
+            return self.mla_kv_lora_rank + self.mla_qk_rope_head_dim;
+        }
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }
@@ -2907,13 +2948,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // mtp.* weights are in the checkpoint. The single terminator
         // (`<|role_end|>`) rides the root eos_token_id — no additive merge.
     } else if (std.mem.eql(u8, model_type, "xing4_0")) {
-        if (config.quant_bits != 0) {
-            log.err("xing4_0: only original BF16 checkpoints are supported\n", .{});
-            return error.UnsupportedXing4Config;
-        }
         // Reference: configuration_xing4_0.py and modeling_xing4_0.py.
         // MLA caches every layer; the residual is an mHC stream, not x + f(x).
         config.model_type = "xing4_0";
+        config.mla_latent_kv = blk: {
+            const raw = std.c.getenv("MLX_SERVE_MLA_LATENT") orelse break :blk true;
+            break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+        };
         config.weight_prefix = "model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3903,6 +3944,96 @@ fn renameWeight(weights: *Weights, from: []const u8, to: []const u8) !void {
     weights.allocator.free(old.key);
 }
 
+/// Stack one Xing expert projection from the original per-expert layout.
+///
+/// The raw checkpoint is BF16-only, but a converted pack may still expose
+/// per-expert affine triples.  Keep the packed weight, scales, and biases in
+/// separate stacked banks so geometry can recover 4-bit params per weight.
+fn stackXingExpertBank(
+    weights: *Weights,
+    layer: u32,
+    projection: []const u8,
+    target_base: []const u8,
+    num_experts: u32,
+    quantized: bool,
+    s: mlx.mlx_stream,
+) !void {
+    const a = weights.allocator;
+    var kind_i: usize = 0;
+    const kind_count: usize = if (quantized) 3 else 1;
+    while (kind_i < kind_count) : (kind_i += 1) {
+        const kind: []const u8 = switch (kind_i) {
+            0 => "weight",
+            1 => "scales",
+            else => "biases",
+        };
+        const parts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(parts);
+        var expected: [2]c_int = undefined;
+        var have_expected = false;
+        var expert: u32 = 0;
+        while (expert < num_experts) : (expert += 1) {
+            var source_buf: [256]u8 = undefined;
+            const source_name = try std.fmt.bufPrint(
+                &source_buf,
+                "model.layers.{d}.mlp.experts.{d}.{s}.{s}",
+                .{ layer, expert, projection, kind },
+            );
+            const tensor = weights.get(source_name) orelse {
+                log.err("missing Xing expert weight: {s}\n", .{source_name});
+                return error.MissingWeight;
+            };
+            const dtype = mlx.mlx_array_dtype(tensor);
+            if (kind_i == 0) {
+                if (quantized) {
+                    if (dtype != .uint32) return error.UnsupportedXingExpertLayout;
+                } else if (dtype != .bfloat16) {
+                    return error.UnsupportedXingExpertLayout;
+                }
+            } else if (dtype != .bfloat16 and dtype != .float16) {
+                return error.UnsupportedXingExpertLayout;
+            }
+            const dims = mlx.getShape(tensor);
+            if (dims.len != 2) return error.UnsupportedXingExpertLayout;
+            if (have_expected) {
+                if (!std.mem.eql(c_int, expected[0..], dims)) return error.UnsupportedXingExpertLayout;
+            } else {
+                expected = .{ dims[0], dims[1] };
+                have_expected = true;
+            }
+            try mlx.check(mlx.mlx_vector_array_append_value(parts, tensor));
+        }
+        var bank = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(bank);
+        try mlx.check(mlx.mlx_stack_axis(&bank, parts, 0, s));
+        try mlx.check(mlx.mlx_array_eval(bank));
+        const target_name = try std.fmt.allocPrint(a, "{s}.{s}", .{ target_base, kind });
+        errdefer a.free(target_name);
+        if (weights.get(target_name) != null) return error.DuplicateWeight;
+        try weights.map.put(target_name, bank);
+    }
+
+    var kind_i_remove: usize = 0;
+    const remove_count: usize = if (quantized) 3 else 1;
+    while (kind_i_remove < remove_count) : (kind_i_remove += 1) {
+        const kind: []const u8 = switch (kind_i_remove) {
+            0 => "weight",
+            1 => "scales",
+            else => "biases",
+        };
+        var expert: u32 = 0;
+        while (expert < num_experts) : (expert += 1) {
+            var source_buf: [256]u8 = undefined;
+            const source_name = std.fmt.bufPrint(
+                &source_buf,
+                "model.layers.{d}.mlp.experts.{d}.{s}.{s}",
+                .{ layer, expert, projection, kind },
+            ) catch unreachable;
+            removeWeight(weights, source_name);
+        }
+    }
+}
+
 /// Bind the original BF16 layout without rewriting the checkpoint on disk.
 /// Each expert bank is evaluated and its source handles released before the
 /// next bank, so staging never retains a second full copy of the experts.
@@ -3934,6 +4065,8 @@ fn prepareXingWeights(weights: *Weights, config: *const ModelConfig) !void {
         const bias_to = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.mlp.gate.expert_bias", .{li});
         try renameWeight(weights, bias_from, bias_to);
         // The reference projects the router in f32, before its sigmoid/top-k.
+        // A packed router stays packed; the Xing forward widens its activation
+        // before qmatmul instead of widening the 8-bit weight at load.
         const router = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.gate.weight", .{li});
         if (weights.map.getPtr(router)) |value| {
             if (mlx.mlx_array_dtype(value.*) == .bfloat16) {
@@ -3945,36 +4078,16 @@ fn prepareXingWeights(weights: *Weights, config: *const ModelConfig) !void {
             }
         }
         for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
-            const target = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.mlp.switch_mlp.{s}.weight", .{ li, proj });
-            if (weights.get(target) != null) continue;
-            const parts = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(parts);
-            var shape: ?[2]c_int = null;
-            for (0..config.num_experts) |ei| {
-                const name = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ li, ei, proj });
-                const tensor = weights.get(name) orelse {
-                    log.err("missing Xing expert weight: {s}\n", .{name});
-                    return error.MissingWeight;
-                };
-                if (mlx.mlx_array_dtype(tensor) != .bfloat16 or mlx.mlx_array_ndim(tensor) != 2)
-                    return error.UnsupportedXingExpertLayout;
-                const dims = mlx.getShape(tensor);
-                if (shape) |expected| {
-                    if (!std.mem.eql(c_int, &expected, dims)) return error.UnsupportedXingExpertLayout;
-                } else shape = .{ dims[0], dims[1] };
-                try mlx.check(mlx.mlx_vector_array_append_value(parts, tensor));
-            }
-            var bank = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(bank);
-            try mlx.check(mlx.mlx_stack_axis(&bank, parts, 0, s));
-            try mlx.check(mlx.mlx_array_eval(bank));
-            const key = try a.dupe(u8, target);
-            errdefer a.free(key);
-            try weights.map.put(key, bank);
-            for (0..config.num_experts) |ei| {
-                const name = std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ li, ei, proj }) catch unreachable;
-                removeWeight(weights, name);
-            }
+            const target_base = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.mlp.switch_mlp.{s}", .{ li, proj });
+            const target_weight = try std.fmt.bufPrint(&from_buf, "{s}.weight", .{target_base});
+            if (weights.get(target_weight) != null) continue;
+            const first_name = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.experts.0.{s}.weight", .{ li, proj });
+            const first = weights.get(first_name) orelse {
+                log.err("missing Xing expert weight: {s}\n", .{first_name});
+                return error.MissingWeight;
+            };
+            const quantized = mlx.mlx_array_dtype(first) == .uint32;
+            try stackXingExpertBank(weights, @intCast(li), proj, target_base, config.num_experts, quantized, s);
         }
     }
 }
@@ -4284,6 +4397,88 @@ test "xing4_0 raw BF16 weights load without an on-disk conversion" {
     try testing.expectEqualSlices(u16, &bits, actual[0..6]);
     try testing.expectEqualSlices(u16, &bits, actual[6..12]);
     try testing.expect(weights.get("model.layers.1.mlp.experts.0.gate_proj.weight") == null);
+}
+
+test "xing4_0 prepare stacks raw affine expert triples without widening them" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..path_len];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{root}, 0);
+    defer a.free(path);
+
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    const qshape = [_]c_int{ 2, 1 };
+    const qdata = [_]u32{ 0x00000021, 0x00000043 };
+    const packed_arr = mlx.mlx_array_new_data(&qdata, &qshape, 2, .uint32);
+    defer _ = mlx.mlx_array_free(packed_arr);
+    const side_bits = [_]u16{ 0x3f80, 0x4000 };
+    const side = mlx.mlx_array_new_data(&side_bits, &qshape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(side);
+    const dense_shape = [_]c_int{ 2, 3 };
+    const dense_bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+    const dense = mlx.mlx_array_new_data(&dense_bits, &dense_shape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(dense);
+    const correction_shape = [_]c_int{2};
+    const correction_data = [_]f32{ 0, 0 };
+    const correction = mlx.mlx_array_new_data(&correction_data, &correction_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(correction);
+
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.o_proj.weight", dense));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.weight", packed_arr));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.scales", side));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.biases", side));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.e_score_correction_bias", correction));
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+        for (0..2) |expert| {
+            for ([_][]const u8{ "weight", "scales", "biases" }) |kind| {
+                const name = try std.fmt.allocPrintSentinel(
+                    a,
+                    "model.layers.1.mlp.experts.{d}.{s}.{s}",
+                    .{ expert, proj, kind },
+                    0,
+                );
+                defer a.free(name);
+                try mlx.check(mlx.mlx_map_string_to_array_insert(
+                    map,
+                    name,
+                    if (std.mem.eql(u8, kind, "weight")) packed_arr else side,
+                ));
+            }
+        }
+    }
+    try mlx.check(mlx.mlx_save_safetensors(path, map, meta));
+
+    const cfg = ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .num_hidden_layers = 2,
+        .num_experts = 2,
+        .first_k_dense_replace = 1,
+        .quant_bits = 8,
+        .quant_group_size = 64,
+        .quant_mode = .affine,
+    };
+    var weights = try loadModelWeights(io, a, root, &cfg, false);
+    defer weights.deinit();
+
+    const bank = weights.get("model.layers.1.mlp.switch_mlp.gate_proj.weight").?;
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(bank));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2, 1 }, mlx.getShape(bank));
+    const scales = weights.get("model.layers.1.mlp.switch_mlp.gate_proj.scales").?;
+    const biases = weights.get("model.layers.1.mlp.switch_mlp.gate_proj.biases").?;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(scales));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(biases));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2, 1 }, mlx.getShape(scales));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2, 1 }, mlx.getShape(biases));
+    try testing.expect(weights.get("model.layers.1.mlp.experts.0.gate_proj.weight") == null);
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(weights.get("model.layers.1.mlp.gate.weight").?));
 }
 
 test "ModelConfig defaults" {
@@ -6609,6 +6804,16 @@ test "xing4_0 config parse (Xing4.0-29B-A4B release geometry)" {
     try testing.expectEqualStrings("model", config.weight_prefix);
     try testing.expect(config.isXing4());
     try testing.expect(config.isMla());
+    const latent_enabled = blk: {
+        const raw = std.c.getenv("MLX_SERVE_MLA_LATENT") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    try testing.expectEqual(latent_enabled, config.mla_latent_kv);
+    if (latent_enabled) {
+        try testing.expectEqualStrings("xing4-mla-latent-v1", config.cacheLayoutNamespace().?);
+    } else {
+        try testing.expect(config.cacheLayoutNamespace() == null);
+    }
     try testing.expect(config.isMoe());
     try testing.expect(!config.isLinearLayer(7)); // NO hybrid layers — every layer is MLA
     try testing.expect(!config.needsSsmEntries());
@@ -6668,6 +6873,74 @@ test "xing4_0 config parse (Xing4.0-29B-A4B release geometry)" {
     try testing.expect(!config.isQwen4());
 }
 
+test "MLA cache geometry separates Xing latent and expanded layouts" {
+    var xing = ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .num_hidden_layers = 40,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 32,
+        .head_dim = 192,
+        .mla_kv_lora_rank = 512,
+        .mla_qk_nope_head_dim = 128,
+        .mla_qk_rope_head_dim = 64,
+        .mla_v_head_dim = 128,
+    };
+
+    xing.mla_latent_kv = true;
+    try testing.expectEqual(@as(u32, 1), xing.kvCacheHeads());
+    try testing.expectEqual(@as(u32, 512), xing.kvCacheHeadDim());
+    try testing.expectEqual(@as(u32, 576), xing.kvCacheWidthSum());
+    try testing.expectEqual(@as(u64, 40 * 576 * 2), xing.kvBytesPerToken());
+    try testing.expectEqual(@as(u32, 576), xing.prefillScoreHeadDim());
+    try testing.expectEqualStrings("xing4-mla-latent-v1", xing.cacheLayoutNamespace().?);
+
+    xing.mla_latent_kv = false;
+    try testing.expectEqual(@as(u32, 32), xing.kvCacheHeads());
+    try testing.expectEqual(@as(u32, 192), xing.kvCacheHeadDim());
+    try testing.expectEqual(@as(u32, 320), xing.kvCacheWidthSum());
+    try testing.expectEqual(@as(u64, 40 * 32 * 320 * 2), xing.kvBytesPerToken());
+    try testing.expectEqual(@as(u32, 192), xing.prefillScoreHeadDim());
+    try testing.expect(xing.cacheLayoutNamespace() == null);
+
+    // A non-MLA GQA config keeps the existing heads and symmetric width.
+    var gqa = ModelConfig{
+        .model_type = "qwen3",
+        .num_hidden_layers = 24,
+        .num_attention_heads = 32,
+        .num_key_value_heads = 8,
+        .head_dim = 128,
+    };
+    try testing.expectEqual(@as(u32, 8), gqa.kvCacheHeads());
+    try testing.expectEqual(@as(u32, 128), gqa.kvCacheHeadDim());
+    try testing.expectEqual(@as(u32, 256), gqa.kvCacheWidthSum());
+    try testing.expectEqual(@as(u64, 24 * 8 * 256 * 2), gqa.kvBytesPerToken());
+    try testing.expectEqual(@as(u32, 128), gqa.prefillScoreHeadDim());
+    try testing.expect(gqa.cacheLayoutNamespace() == null);
+}
+
+test "xing4_0 config parse accepts mixed affine input" {
+    const json =
+        \\{
+        \\  "model_type": "xing4_0",
+        \\  "hidden_size": 3584, "num_hidden_layers": 40,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32,
+        \\  "vocab_size": 131072,
+        \\  "q_lora_rank": 768, "kv_lora_rank": 512,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "n_routed_experts": 64, "first_k_dense_replace": 2,
+        \\  "n_shared_experts": 1,
+        \\  "hc_mult": 4, "hc_sinkhorn_iters": 20,
+        \\  "rope_interleave": true,
+        \\  "quantization": {"bits": 8, "group_size": 64, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
 test "xing4_0 honest rejects: every variant the forward cannot serve refuses by NAME" {
     // Same policy as bailing/dsv4: refuse loudly over serving silently wrong
     // math. The template substitutes the WHOLE value for the keys variants
@@ -6713,7 +6986,6 @@ test "xing4_0 honest rejects: every variant the forward cannot serve refuses by 
         iters: []const u8 = "20",
         bits: []const u8 = "0",
     }{
-        .{ .why = "only the original BF16 weight layout is supported", .bits = "4" },
         .{ .why = "softmax-style router scores", .scoring = "gpt" },
         .{ .why = "halves-form RoPE, not adjacent pairs", .interleave = "false" },
         .{ .why = "mix buffers are fixed-width to 8", .hc_mult = "9" },

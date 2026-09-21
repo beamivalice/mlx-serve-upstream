@@ -159,8 +159,8 @@ def patch_reference_init(modeling):
     modeling.Xing4_0PreTrainedModel._init_weights = fixture_init
 
 
-def make_config(configuration):
-    config = configuration.Xing4_0Config(**TINY)
+def make_config(configuration, params=None):
+    config = configuration.Xing4_0Config(**(TINY if params is None else params))
     config._attn_implementation = "eager"
     return config
 
@@ -170,8 +170,22 @@ def randomize_model(model, modeling):
     """Use non-degenerate deterministic values for every exercised component."""
 
     for name, parameter in model.named_parameters():
+        # Preserve activation variance when widening the tiny fixture for g64.
+        nominal = TINY["hidden_size"]
         if name.endswith("hc_fn"):
-            torch.nn.init.normal_(parameter, mean=0.0, std=0.05)
+            nominal *= TINY["hc_mult"]
+        elif ".q_b_proj." in name:
+            nominal = TINY["q_lora_rank"]
+        elif ".kv_b_proj." in name:
+            nominal = TINY["kv_lora_rank"]
+        elif ".o_proj." in name:
+            nominal = TINY["num_attention_heads"] * TINY["v_head_dim"]
+        elif ".down_proj." in name:
+            layer = int(name.split(".layers.", 1)[1].split(".", 1)[0])
+            nominal = TINY["intermediate_size"] if layer < TINY["first_k_dense_replace"] else TINY["moe_intermediate_size"]
+        fan_scale = (nominal / parameter.shape[-1]) ** 0.5 if parameter.ndim >= 2 else 1
+        if name.endswith("hc_fn"):
+            torch.nn.init.normal_(parameter, mean=0.0, std=0.05 * fan_scale)
         elif name.endswith("hc_base"):
             torch.nn.init.normal_(parameter, mean=0.0, std=0.12)
         elif name.endswith("hc_scale"):
@@ -183,9 +197,9 @@ def randomize_model(model, modeling):
                 )
             )
         elif ".mlp.gate.weight" in name:
-            torch.nn.init.normal_(parameter, mean=0.0, std=0.25)
+            torch.nn.init.normal_(parameter, mean=0.0, std=0.25 * fan_scale)
         elif parameter.ndim >= 2:
-            std = 0.08 if "embed_tokens" in name else 0.05
+            std = 0.08 if "embed_tokens" in name else 0.05 * fan_scale
             torch.nn.init.normal_(parameter, mean=0.0, std=std)
         elif "norm" in name or name.endswith(".weight"):
             parameter.copy_(1.0 + torch.randn_like(parameter) * 0.05)
@@ -198,7 +212,7 @@ def randomize_model(model, modeling):
     correction = torch.linspace(
         -0.35,
         0.30,
-        TINY["n_routed_experts"],
+        model.config.n_routed_experts,
         dtype=torch.float32,
     ).to(torch.bfloat16).float()
     for layer in model.model.layers:
@@ -235,11 +249,22 @@ def config_json(config):
     return data
 
 
-def build(out: Path, reference_dir: Path):
+def build(out: Path, reference_dir: Path, quant_ready=False, top_k=None):
     configuration, modeling = import_reference(reference_dir)
     patch_reference_init(modeling)
     torch.manual_seed(DEFAULT_SEED)
-    config = make_config(configuration)
+    params = dict(TINY)
+    if quant_ready:
+        params.update(
+            hidden_size=64, intermediate_size=128, moe_intermediate_size=64,
+            q_lora_rank=64, kv_lora_rank=64, qk_nope_head_dim=32,
+            qk_rope_head_dim=64, v_head_dim=16,
+            # Quantized arithmetic and top-k selection have separate guards.
+            num_experts_per_tok=TINY["n_routed_experts"],
+        )
+    if top_k is not None:
+        params["num_experts_per_tok"] = top_k
+    config = make_config(configuration, params)
     model = modeling.Xing4_0ForCausalLM(config).eval()
     randomize_model(model, modeling)
     state = checkpoint_state(model)
@@ -257,6 +282,10 @@ def build(out: Path, reference_dir: Path):
             "weights_dtype": "bfloat16",
         },
     )
+    (out / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": sum(t.numel() * t.element_size() for t in state.values())},
+        "weight_map": {name: "model.safetensors" for name in state},
+    }, indent=2) + "\n")
     (out / "config.json").write_text(
         json.dumps(config_json(config), indent=2) + "\n",
         encoding="utf-8",
@@ -267,18 +296,62 @@ def build(out: Path, reference_dir: Path):
     )
 
 
+def reference_state(model_dir: Path):
+    """Read original BF16 or canonical affine4/8 tensors into HF's layout."""
+    index = model_dir / "model.safetensors.index.json"
+    if index.exists():
+        names = sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        files = [model_dir / name for name in names]
+    else:
+        files = sorted(model_dir.glob("*.safetensors"))
+    packed = {}
+    for file in files:
+        packed.update(load_file(str(file), device="cpu"))
+    state = {}
+    for name, tensor in packed.items():
+        if name.endswith((".scales", ".biases")):
+            continue
+        if tensor.dtype == torch.uint32:
+            base = name.removesuffix(".weight")
+            scales, biases = packed[base + ".scales"], packed[base + ".biases"]
+            width = scales.shape[-1] * 64
+            bits = tensor.shape[-1] * 32 // width
+            if bits not in (4, 8) or tensor.shape[-1] * 32 != width * bits:
+                raise ValueError(f"unsupported affine geometry: {name}")
+            shifts = torch.arange(0, 32, bits, dtype=torch.int64)
+            codes = ((tensor.to(torch.int64).unsqueeze(-1) >> shifts) & ((1 << bits) - 1))
+            codes = codes.reshape(*tensor.shape[:-1], scales.shape[-1], 64).float()
+            tensor = (codes * scales.float().unsqueeze(-1) + biases.float().unsqueeze(-1))
+            dtype = torch.float32 if name.endswith(".mlp.gate.weight") else scales.dtype
+            tensor = tensor.reshape(*scales.shape[:-1], width).to(dtype)
+        name = name.replace(".attention.", ".self_attn.").replace(".self_attn.dense.", ".self_attn.o_proj.")
+        name = name.replace(".hc_fn.weight", ".hc_fn").replace(".gate.expert_bias", ".gate.e_score_correction_bias")
+        if ".mlp.switch_mlp." in name:
+            prefix, suffix = name.split(".mlp.switch_mlp.", 1)
+            for i, expert in enumerate(tensor):
+                state[f"{prefix}.mlp.experts.{i}.{suffix}"] = expert.contiguous()
+        else:
+            state[name] = tensor
+    return state
+
+
 def load_reference_model(model_dir: Path, reference_dir: Path, dtype):
     configuration, modeling = import_reference(reference_dir)
     patch_reference_init(modeling)
-    config = make_config(configuration)
-    state = load_file(str(model_dir / "model.safetensors"), device="cpu")
+    config = make_config(configuration, json.loads((model_dir / "config.json").read_text()))
+    state = reference_state(model_dir)
+    state = {
+        name: tensor for name, tensor in state.items()
+        if not name.startswith("model.layers.")
+        or int(name.split(".")[2]) < config.num_hidden_layers
+    }
     model = modeling.Xing4_0ForCausalLM(config).eval()
     model.load_state_dict(state, strict=True)
     model = model.to(dtype).eval()
     if dtype == torch.bfloat16:
         # The native loader keeps these two checkpoint F32 control tensors F32.
         for name, parameter in model.named_parameters():
-            if name.endswith(".hc_scale"):
+            if name.endswith(".hc_scale") or (name.endswith(".mlp.gate.weight") and state[name].dtype == torch.float32):
                 parameter.data = state[name].float().clone()
         for name, buffer in model.named_buffers():
             if name.endswith(".e_score_correction_bias"):
@@ -386,6 +459,8 @@ def main():
 
     p_build = sub.add_parser("build")
     p_build.add_argument("--out", type=Path, required=True)
+    p_build.add_argument("--quant-ready", action="store_true", help="make every linear input width divisible by group size 64")
+    p_build.add_argument("--top-k", type=int, help="override active experts (quant-ready defaults to all experts to isolate arithmetic)")
 
     p_dump = sub.add_parser("dump")
     p_dump.add_argument("--model", type=Path, required=True)
@@ -394,7 +469,7 @@ def main():
 
     args = parser.parse_args()
     if args.command == "build":
-        build(args.out, args.reference_dir)
+        build(args.out, args.reference_dir, args.quant_ready, args.top_k)
     else:
         dump(args.model, args.out, args.reference_dir, not args.no_long)
 

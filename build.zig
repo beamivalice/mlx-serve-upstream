@@ -283,6 +283,8 @@ pub fn build(b: *std.Build) void {
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    // Runtime environment and GPU fixtures are not part of Zig's result cache.
+    run_unit_tests.has_side_effects = true;
     if (qwen_preprocess_fixture) |fixture| {
         run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
         run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });

@@ -3300,7 +3300,22 @@ fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
     pd.deleteTree(io, name) catch {};
 }
 
+/// Historical fingerprint for the expanded/default cache layout. Kept as a
+/// wrapper so existing callers and existing expanded SSD roots remain stable.
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
+    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+/// Fingerprint a model plus an optional runtime cache-layout namespace.
+/// Geometry-changing layouts must use a versioned marker so an old SSD root
+/// cannot restore tensors with incompatible head/width shapes. A null marker
+/// deliberately preserves the pre-layout fingerprint for every other arch.
+pub fn modelFingerprintWithLayout(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_dir: []const u8,
+    layout_namespace: ?[]const u8,
+) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -3312,6 +3327,10 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
         h.update(std.mem.asBytes(&mt));
     }
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout_namespace) |layout| {
+        h.update("\x00mlx-serve-kv-layout\x00");
+        h.update(layout);
+    }
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -5325,6 +5344,38 @@ test "modelFingerprint: rolls with --config-overrides" {
     const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
     defer testing.allocator.free(fp_ws);
     try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
+}
+
+test "modelFingerprint: cache layout namespace isolates Xing latent KV" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"xing4_0\"}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir);
+
+    const old = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(old);
+    const expanded = try modelFingerprintWithLayout(testing.allocator, io, dir, null);
+    defer testing.allocator.free(expanded);
+    try testing.expectEqualStrings(old, expanded);
+
+    const latent = try modelFingerprintWithLayout(testing.allocator, io, dir, "xing4-mla-latent-v1");
+    defer testing.allocator.free(latent);
+    try testing.expect(!std.mem.eql(u8, old, latent));
+
+    // The old namespace remains byte-stable for all callers that do not select
+    // a layout marker; a different marker is a separate SSD root.
+    const latent_again = try modelFingerprintWithLayout(testing.allocator, io, dir, "xing4-mla-latent-v1");
+    defer testing.allocator.free(latent_again);
+    try testing.expectEqualStrings(latent, latent_again);
+    const other = try modelFingerprintWithLayout(testing.allocator, io, dir, null);
+    defer testing.allocator.free(other);
+    try testing.expectEqualStrings(old, other);
 }
 
 test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {

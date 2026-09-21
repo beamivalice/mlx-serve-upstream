@@ -82,13 +82,13 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
 | `laguna` | poolside Laguna S 2.1 | `model` | -- | 256/top-10 | Pure-attention MoE coder (nvfp4 experts); per-layer Q-heads, softplus attn gate, YaRN rope. See "Laguna" below. |
-| `xing4_0` | Xing4.0-29B-A4B | `model` | -- | 64/top-4 | Original BF16 checkpoint; full MLA + four-stream mHC; serial, no MTP. |
+| `xing4_0` | Xing4.0-29B-A4B | `model` | -- | 64/top-4 | Original BF16 or mixed affine4/8 g64; latent MLA + four-stream mHC; serial, no MTP. |
 | `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
 
-### Xing4.0 BF16
+### Xing4.0 BF16 and mixed affine
 
 `xing4_0` loads the original Hugging Face checkpoint directly. No Python runtime,
 quantization, or on-disk weight conversion is required. The 41 shards contain
@@ -100,6 +100,13 @@ zig-out/bin/mlx-serve --model /path/to/Xing4.0-29B-A4B \
   --serve --host 127.0.0.1 --ctx-size 4096
 ```
 
+- `tests/convert_xing4_weights.py --src <original> --out <new> --verify`
+  creates affine group-64 weights: routed experts at 4 bits; embeddings, head,
+  attention, shared experts, router and mHC projections at 8 bits. Norms and
+  scalar controls stay unquantized. It refuses an existing destination, validates
+  required tensors and file ranges, and records output SHA256 checksums.
+  `--verify-existing <pack> --src <original>` audits without rewriting weights;
+  `--write-checksums <pack>` explicitly adopts checksums for an older manifest.
 - `model.prepareXingWeights` binds the raw `self_attn.*` names to MLA, stacks
   each expert bank in numeric order, then releases its source handles. The extra
   `model.layers.40.*` MTP layer is excluded, as in the reference base model.
@@ -107,10 +114,21 @@ zig-out/bin/mlx-serve --model /path/to/Xing4.0-29B-A4B \
   four mHC residual streams around attention and FFN. Router projection, selection
   weights and weighted expert accumulation are f32; the residual stays BF16.
   mHC normalizes in f32 and casts its gains/products back at the reference boundaries.
+- `mla.zig` caches one normalized 512-wide latent and one post-RoPE 64-wide key
+  per layer, rather than 32 expanded K/V heads: **46,080 vs 819,200 BF16 bytes/token**.
+  Decode absorbs the key/value projections; wide prefills may expand only a
+  temporary working view. Heads share GEMM bank reads. `MLX_SERVE_MLA_LATENT=0`
+  restores expanded caching; `MLX_SERVE_MLA_PREFILL_EXPAND=0` forces absorbed prefill.
+  Latent SSD entries use a separate versioned namespace, so old expanded entries
+  cannot be restored into them. The RAM tier remains per loaded model.
+- `xing_hc.zig` fuses the post-exp Sinkhorn rounds with SIMD shuffles
+  (`MLX_SERVE_XING_SINKHORN=0` restores the chain). Routing keeps f32 scores through
+  the fused router; dense expert prefill honors sorted assignments with the pinned
+  MLX stride fix. MTP and batching are not added by these optimizations.
 - YaRN uses 64 rotary dimensions and a scale on the **entire** QK score.
   `rope_interleave` defaults to true when absent. Stored head width and rotary
-  width are distinct; quantized-KV dequant staging is conservatively billed at
-  twice the larger K/V width.
+  width are distinct. Admission bills the actual latent K/V widths and explicit
+  score/cast working buffers, including at widths normally eligible for fused SDPA.
 - `tokenizer.model` is loaded natively for SentencePiece BPE with the identity
   normalizer. Special-token interception follows `tokenizer_config.json`, not
   every control-piece spelling in the protobuf. In particular, the template's
@@ -121,9 +139,13 @@ zig-out/bin/mlx-serve --model /path/to/Xing4.0-29B-A4B \
   is retained. Native MTP and assistant sidecars are not enabled.
 - Tests: `zig build test -Doptimize=ReleaseFast -Dtest-filter=xing4`;
   `tests/dump_xing4_fixtures.py` plus the `xing4 fixture` test compare original-layout
-  tiny BF16 weights with the CPU reference, including position-4096 cached decode;
-  `python3 tests/test_xing4.py /path/to/Xing4.0-29B-A4B` runs real HTTP checks.
-  Full 256K context and quantized weight packs are not validation claims.
+  tiny BF16 weights with the CPU reference, including position-4096 cached decode.
+  `--quant-ready` builds group-64-compatible fixtures with all experts active
+  to isolate quantized arithmetic; separate router tests cover top-k selection.
+  `python3 tests/test_xing4.py <checkpoint>` runs real HTTP checks; the
+  `test_xing4_context.py` client checks repeated long prompts and prefix reuse.
+  Mixed-affine 32K cold/warm/divergent requests were tested; full 128K/256K
+  runtime validation is not claimed. Attention is still dense, not sparse.
 
 ### GGUF auto-routing
 

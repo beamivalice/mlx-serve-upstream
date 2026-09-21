@@ -121,13 +121,17 @@ fn compare(
 ) !CompareStats {
     try testing.expectEqual(want.len, got.len);
     var max_abs: f64 = 0;
+    var worst_index: usize = 0;
     var err_sq: f64 = 0;
     var ref_sq: f64 = 0;
-    for (got, want) |g, w| {
+    for (got, want, 0..) |g, w, i| {
         try testing.expect(std.math.isFinite(g));
         try testing.expect(std.math.isFinite(w));
         const diff = @abs(@as(f64, g) - @as(f64, w));
-        max_abs = @max(max_abs, diff);
+        if (diff > max_abs) {
+            max_abs = diff;
+            worst_index = i;
+        }
         err_sq += diff * diff;
         ref_sq += @as(f64, w) * @as(f64, w);
     }
@@ -136,8 +140,8 @@ fn compare(
     const rms_ref = @sqrt(ref_sq / n);
     const rms_limit = @max(1e-6, rms_ref * rms_relative_limit);
     std.debug.print(
-        "[xing4-fixture] {s}: max_abs={d:.6} rms_err={d:.6} rms_ref={d:.6} limit={d:.6}\n",
-        .{ label, max_abs, rms_err, rms_ref, rms_limit },
+        "[xing4-fixture] {s}: max_abs={d:.6} at={d} rms_err={d:.6} rms_ref={d:.6} limit={d:.6}\n",
+        .{ label, max_abs, worst_index, rms_err, rms_ref, rms_limit },
     );
     try testing.expect(max_abs <= max_abs_limit);
     try testing.expect(rms_err <= rms_limit);
@@ -248,6 +252,14 @@ test "xing4 fixture: original BF16 checkpoint matches CPU reference" {
     const short = try runShort(&xfm, allocator, input_ids, decode_ids, vocab);
     defer allocator.free(short.prefill);
     defer allocator.free(short.decode);
+    // The cache stores exactly the configured representation in both A/B arms.
+    for (xfm.cache.entries) |entry| {
+        const heads: c_int = @intCast(config.kvCacheHeads());
+        const key_width: c_int = @intCast(if (config.mla_latent_kv) config.mla_qk_rope_head_dim else config.mlaQkHeadDim());
+        const value_width: c_int = @intCast(if (config.mla_latent_kv) config.mla_kv_lora_rank else config.mla_v_head_dim);
+        try expectShape(entry.key_view, &.{ 1, heads, @intCast(input_ids.len + decode_ids.len), key_width });
+        try expectShape(entry.value_view, &.{ 1, heads, @intCast(input_ids.len + decode_ids.len), value_width });
+    }
     _ = try compare("prefill vs BF16 reference", short.prefill, want_prefill_bf16, 0.02, 0.01);
     _ = try compare("decode vs BF16 reference", short.decode, want_decode_bf16, 0.02, 0.01);
     _ = try compare("prefill vs F32 truth", short.prefill, want_prefill_f32, 0.02, 0.01);
