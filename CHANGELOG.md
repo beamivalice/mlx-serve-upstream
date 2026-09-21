@@ -9,6 +9,7 @@
 
 ### Changes
 - Several long requests restored from the prefix cache at once no longer overrun GPU memory (a failed generation, or a kernel panic on a 16 GB Mac): each is billed against what the others were promised, and the server now leaves the OS a memory reserve (`--os-reserve-gib`, a toggle in Settings).
+- Xing4.0-29B-A4B BF16 checkpoints run natively with MLA attention, mHC residual streams, thinking, and tool calls; MTP is not enabled.
 - Concurrent long prompts that do not fit in GPU memory together now wait their turn instead of overrunning it (a crash, or a kernel panic on macOS 26.5); a DFlash drafter's context is part of the memory bill.
 - With a DFlash drafter loaded, concurrent requests use the MTP head so they batch: four streams on the 27B went from 64 to 122 tok/s (M4 Max).
 - 8-bit KV is now as fast as or faster than bf16 KV at long context: quantized attention runs through Apple's matmul2d tensor op (Qwen3.8-27B MTP on M4 Max: 16K 45 to 55 tok/s, 32K 37 to 51).

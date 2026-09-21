@@ -1,8 +1,25 @@
 const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
+const sentencepiece_proto = @import("sentencepiece.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
+
+const SentencePieceState = struct {
+    scores: std.StringHashMap(f32),
+    user_defined: std.StringHashMap(u32),
+    types: []sentencepiece_proto.PieceType,
+    byte_ids: [256]?u32,
+    byte_fallback: bool,
+    unk_id: u32,
+    add_dummy_prefix: bool,
+};
+
+const NativeSpecialSpec = struct {
+    id: ?u32,
+    content: []const u8,
+    flagged: bool,
+};
 
 /// An added token flagged `special: true` in tokenizer.json.
 pub const FlaggedSpecial = struct { id: u32, content: []const u8 };
@@ -105,6 +122,14 @@ pub const Tokenizer = struct {
     /// speedup on Gemma-class tokenizers (262k vocab + 514k merges).
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
 
+    /// Native `tokenizer.model` state. Its map keys borrow the owned vocab
+    /// strings above; the state is absent for tokenizer.json/slow-BPE loads.
+    sentencepiece: ?SentencePieceState = null,
+    /// HF's tokenizer_config added-token set. Native SentencePiece also
+    /// records every CONTROL piece in `special_tokens` for marker lookup, but
+    /// only this set is intercepted while encoding when tokenizer_config exists.
+    encode_special_tokens: ?std.StringHashMap(u32) = null,
+
     /// Added tokens flagged `special: true` in tokenizer.json — the
     /// candidate set for reserved-output suppression. NOT the same as
     /// `special_tokens`, which deliberately holds ALL added tokens
@@ -151,13 +176,29 @@ pub const Tokenizer = struct {
     }
 
     pub fn deinit(self: *Tokenizer) void {
-        // Map keys/values either point into `parsed_json`'s arena (no
-        // per-entry free needed) or were duped explicitly when no parsed
-        // JSON is held (e.g., the test-only constructors). Freeing the
-        // parsed JSON deinits its arena in one shot.
-        if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
+        // JSON-loaded keys borrow `parsed_json`'s arena; native SentencePiece
+        // keys and flagged marker content are duplicated and freed below.
+        // Freeing parsed JSON deinits its arena in one shot.
+        if (self.flagged_specials.len > 0) {
+            if (self.sentencepiece != null) {
+                for (self.flagged_specials) |sp| self.allocator.free(sp.content);
+            }
+            self.allocator.free(self.flagged_specials);
+        }
         if (self.marker_aliases) |*m| m.deinit();
         if (self.marker_closers) |*m| m.deinit();
+        if (self.sentencepiece) |*sp| {
+            sp.scores.deinit();
+            sp.user_defined.deinit();
+            self.allocator.free(sp.types);
+        }
+        if (self.encode_special_tokens) |*m| {
+            if (self.sentencepiece != null) {
+                var it = m.iterator();
+                while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            }
+            m.deinit();
+        }
         if (self.parsed_json) |*p| {
             self.vocab.deinit();
             self.id_to_token.deinit();
@@ -214,13 +255,14 @@ pub const Tokenizer = struct {
         // first byte matches. Semantics unchanged — earliest occurrence
         // wins, longest special wins at the same position (buckets are
         // sorted by descending length, so the first hit is the longest).
-        const n_special = self.special_tokens.count();
+        const special_tokens = if (self.encode_special_tokens) |*m| m else &self.special_tokens;
+        const n_special = special_tokens.count();
         const Cand = struct { bytes: []const u8, id: u32 };
         const cands = try allocator.alloc(Cand, n_special);
         defer allocator.free(cands);
         {
             var i: usize = 0;
-            var sit = self.special_tokens.iterator();
+            var sit = special_tokens.iterator();
             while (sit.next()) |entry| : (i += 1) {
                 cands[i] = .{ .bytes = entry.key_ptr.*, .id = entry.value_ptr.* };
             }
@@ -283,7 +325,10 @@ pub const Tokenizer = struct {
     /// Encode a text segment (no special tokens) using the appropriate method.
     fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
         return switch (self.tok_type) {
-            .sentencepiece_bpe => self.encodeSentencePiece(allocator, text),
+            .sentencepiece_bpe => if (self.sentencepiece != null)
+                self.encodeNativeSentencePiece(allocator, text)
+            else
+                self.encodeSentencePiece(allocator, text),
             .byte_level_bpe => self.encodeByteLevel(allocator, text),
             .wordpiece => self.encodeWordPiece(allocator, text),
         };
@@ -292,7 +337,10 @@ pub const Tokenizer = struct {
     /// Decode token IDs to text.
     pub fn decode(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32, strip_leading_space: bool) ![]u8 {
         return switch (self.tok_type) {
-            .sentencepiece_bpe => self.decodeSentencePiece(allocator, ids, strip_leading_space),
+            .sentencepiece_bpe => if (self.sentencepiece != null)
+                self.decodeNativeSentencePiece(allocator, ids, strip_leading_space)
+            else
+                self.decodeSentencePiece(allocator, ids, strip_leading_space),
             .byte_level_bpe => self.decodeByteLevel(allocator, ids),
             .wordpiece => self.decodeWordPiece(allocator, ids),
         };
@@ -313,13 +361,13 @@ pub const Tokenizer = struct {
         var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
         errdefer map.deinit();
         const pairs = [_][2][]const u8{
-            .{ "<ifm|think>", "<think>" },              .{ "</ifm|think>", "</think>" },
-            .{ "<ifm|think_fast>", "<think>" },         .{ "</ifm|think_fast>", "</think>" },
-            .{ "<ifm|think_faster>", "<think>" },       .{ "</ifm|think_faster>", "</think>" },
-            .{ "<ifm|tool_calls>", "<tool_calls>" },    .{ "</ifm|tool_calls>", "</tool_calls>" },
-            .{ "<ifm|tool_call>", "<tool_call>" },      .{ "</ifm|tool_call>", "</tool_call>" },
-            .{ "<ifm|arg_key>", "<arg_key>" },          .{ "</ifm|arg_key>", "</arg_key>" },
-            .{ "<ifm|arg_value>", "<arg_value>" },      .{ "</ifm|arg_value>", "</arg_value>" },
+            .{ "<ifm|think>", "<think>" },           .{ "</ifm|think>", "</think>" },
+            .{ "<ifm|think_fast>", "<think>" },      .{ "</ifm|think_fast>", "</think>" },
+            .{ "<ifm|think_faster>", "<think>" },    .{ "</ifm|think_faster>", "</think>" },
+            .{ "<ifm|tool_calls>", "<tool_calls>" }, .{ "</ifm|tool_calls>", "</tool_calls>" },
+            .{ "<ifm|tool_call>", "<tool_call>" },   .{ "</ifm|tool_call>", "</tool_call>" },
+            .{ "<ifm|arg_key>", "<arg_key>" },       .{ "</ifm|arg_key>", "</arg_key>" },
+            .{ "<ifm|arg_value>", "<arg_value>" },   .{ "</ifm|arg_value>", "</arg_value>" },
         };
         for (pairs) |pair| {
             if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
@@ -399,6 +447,79 @@ pub const Tokenizer = struct {
         }
 
         // Replace ▁ (0xE2 0x96 0x81) with space
+        var output = try allocator.alloc(u8, result.items.len);
+        var out_len: usize = 0;
+        var i: usize = 0;
+        while (i < result.items.len) {
+            if (i + 2 < result.items.len and
+                result.items[i] == 0xE2 and
+                result.items[i + 1] == 0x96 and
+                result.items[i + 2] == 0x81)
+            {
+                output[out_len] = ' ';
+                out_len += 1;
+                i += 3;
+            } else {
+                output[out_len] = result.items[i];
+                out_len += 1;
+                i += 1;
+            }
+        }
+
+        const start: usize = if (strip_leading_space and out_len > 0 and output[0] == ' ') 1 else 0;
+        const final_out = try allocator.dupe(u8, output[start..out_len]);
+        allocator.free(output);
+        return final_out;
+    }
+
+    fn encodeNativeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        const state: *const SentencePieceState = &(self.sentencepiece.?);
+        var normalized: std.ArrayList(u8) = .empty;
+        defer normalized.deinit(allocator);
+
+        if (text.len == 0) return self.spBpeMerge(allocator, normalized.items);
+        if (state.add_dummy_prefix) try normalized.appendSlice(allocator, "\xe2\x96\x81");
+        for (text) |byte| {
+            if (byte == ' ') {
+                try normalized.appendSlice(allocator, "\xe2\x96\x81");
+            } else {
+                try normalized.append(allocator, byte);
+            }
+        }
+        return self.spBpeMerge(allocator, normalized.items);
+    }
+
+    fn decodeNativeSentencePiece(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32, strip_leading_space: bool) ![]u8 {
+        const state: *const SentencePieceState = &(self.sentencepiece.?);
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(allocator);
+
+        for (ids) |id| {
+            const token = self.id_to_token.get(id) orelse continue;
+            const kind = if (id < state.types.len) state.types[id] else .normal;
+            switch (kind) {
+                .control => {
+                    // HF's Xing tokenizer preserves configured AddedTokens
+                    // during decode, while raw SentencePiece suppresses
+                    // unconfigured CONTROL pieces.
+                    const configured = if (self.encode_special_tokens) |*m|
+                        m.contains(token)
+                    else
+                        true;
+                    if (configured) try result.appendSlice(allocator, token);
+                },
+                .unknown => try result.appendSlice(allocator, " \xe2\x81\x87 "),
+                .byte => {
+                    const byte = sentencePieceByteValue(token) orelse return error.InvalidSentencePieceModel;
+                    try result.append(allocator, byte);
+                },
+                .normal, .user_defined => try result.appendSlice(allocator, token),
+            }
+        }
+
+        // SentencePiece decodes the metaspace marker only after concatenating
+        // pieces. This is important for a multi-token prompt: stripping one
+        // leading space is a caller option, not a per-token operation.
         var output = try allocator.alloc(u8, result.items.len);
         var out_len: usize = 0;
         var i: usize = 0;
@@ -616,6 +737,8 @@ pub const Tokenizer = struct {
         prev: i32,
         next: i32,
         ver: u32,
+        atomic: bool = false,
+        fallback_byte: ?u8 = null,
     };
 
     /// Candidate pair in the merge heap, ordered by (rank, left node index).
@@ -638,6 +761,7 @@ pub const Tokenizer = struct {
     const BpeHeap = std.PriorityQueue(BpeCand, void, BpeCand.order);
 
     fn bpePushCand(self: *const Tokenizer, allocator: std.mem.Allocator, heap: *BpeHeap, nodes: []const BpeNode, input: []const u8, l: u32, r: u32) !void {
+        if (nodes[l].atomic or nodes[r].atomic) return;
         const pair = MergePair{
             .left = input[nodes[l].start..nodes[l].end],
             .right = input[nodes[r].start..nodes[r].end],
@@ -720,6 +844,217 @@ pub const Tokenizer = struct {
             }
         }
 
+        return ids.toOwnedSlice(allocator);
+    }
+
+    const SpBpeCand = struct {
+        score: f32,
+        left: u32,
+        right: u32,
+        lver: u32,
+        rver: u32,
+
+        fn order(_: void, a: SpBpeCand, b: SpBpeCand) std.math.Order {
+            if (a.score != b.score) {
+                return if (a.score > b.score) .lt else .gt;
+            }
+            return std.math.order(a.left, b.left);
+        }
+    };
+
+    const SpBpeHeap = std.PriorityQueue(SpBpeCand, void, SpBpeCand.order);
+
+    const SpUserCand = struct {
+        bytes: []const u8,
+    };
+
+    fn spMatchUserDefined(
+        cands: []const SpUserCand,
+        bucket_start: *const [257]u32,
+        input: []const u8,
+        pos: usize,
+    ) ?usize {
+        var ci = bucket_start[input[pos]];
+        const cend = bucket_start[@as(usize, input[pos]) + 1];
+        while (ci < cend) : (ci += 1) {
+            const text = cands[ci].bytes;
+            if (text.len <= input.len - pos and
+                std.mem.startsWith(u8, input[pos..], text))
+            {
+                return pos + text.len;
+            }
+        }
+        return null;
+    }
+
+    fn spPushCand(
+        self: *const Tokenizer,
+        allocator: std.mem.Allocator,
+        heap: *SpBpeHeap,
+        nodes: []const BpeNode,
+        input: []const u8,
+        l: u32,
+        r: u32,
+    ) !void {
+        if (nodes[l].atomic or nodes[r].atomic) return;
+        const state: *const SentencePieceState = &(self.sentencepiece.?);
+        const pair = input[nodes[l].start..nodes[r].end];
+        if (state.scores.get(pair)) |score| {
+            try heap.push(allocator, .{
+                .score = score,
+                .left = l,
+                .right = r,
+                .lver = nodes[l].ver,
+                .rver = nodes[r].ver,
+            });
+        }
+    }
+
+    fn spBpeMerge(self: *const Tokenizer, allocator: std.mem.Allocator, input: []const u8) ![]u32 {
+        const state: *const SentencePieceState = &(self.sentencepiece.?);
+        const user_cands = try allocator.alloc(SpUserCand, state.user_defined.count());
+        defer allocator.free(user_cands);
+        {
+            var i: usize = 0;
+            var it = state.user_defined.iterator();
+            while (it.next()) |entry| : (i += 1) {
+                user_cands[i] = .{ .bytes = entry.key_ptr.* };
+            }
+        }
+        std.mem.sort(SpUserCand, user_cands, {}, struct {
+            fn lessThan(_: void, a: SpUserCand, b: SpUserCand) bool {
+                const ab: u8 = if (a.bytes.len > 0) a.bytes[0] else 0;
+                const bb: u8 = if (b.bytes.len > 0) b.bytes[0] else 0;
+                if (ab != bb) return ab < bb;
+                return a.bytes.len > b.bytes.len;
+            }
+        }.lessThan);
+        var user_bucket_start: [257]u32 = @splat(0);
+        {
+            var ci: usize = 0;
+            for (0..256) |b| {
+                user_bucket_start[b] = @intCast(ci);
+                while (ci < user_cands.len and user_cands[ci].bytes.len > 0 and user_cands[ci].bytes[0] == b) ci += 1;
+            }
+            user_bucket_start[256] = @intCast(user_cands.len);
+        }
+
+        var nodes: std.ArrayList(BpeNode) = .empty;
+        defer nodes.deinit(allocator);
+
+        var idx: usize = 0;
+        while (idx < input.len) {
+            if (spMatchUserDefined(user_cands, &user_bucket_start, input, idx)) |end| {
+                const node_index: i32 = @intCast(nodes.items.len);
+                try nodes.append(allocator, .{
+                    .start = @intCast(idx),
+                    .end = @intCast(end),
+                    .prev = node_index - 1,
+                    .next = -1,
+                    .ver = 0,
+                    .atomic = true,
+                });
+                if (node_index > 0) nodes.items[@intCast(node_index - 1)].next = node_index;
+                idx = end;
+                continue;
+            }
+
+            const cp_len = std.unicode.utf8ByteSequenceLength(input[idx]) catch 1;
+            const end = @min(idx + cp_len, input.len);
+            const symbol = input[idx..end];
+            const known = state.scores.contains(symbol);
+            if (!known and state.byte_fallback) {
+                // BYTE pieces are indivisible symbols. They must not be merged
+                // with the surrounding BPE stream.
+                for (idx..end) |byte_pos| {
+                    const node_index: i32 = @intCast(nodes.items.len);
+                    try nodes.append(allocator, .{
+                        .start = @intCast(byte_pos),
+                        .end = @intCast(byte_pos + 1),
+                        .prev = node_index - 1,
+                        .next = -1,
+                        .ver = 0,
+                        .atomic = true,
+                        .fallback_byte = input[byte_pos],
+                    });
+                    if (node_index > 0) nodes.items[@intCast(node_index - 1)].next = node_index;
+                }
+            } else {
+                const node_index: i32 = @intCast(nodes.items.len);
+                try nodes.append(allocator, .{
+                    .start = @intCast(idx),
+                    .end = @intCast(end),
+                    .prev = node_index - 1,
+                    .next = -1,
+                    .ver = 0,
+                    // Without byte fallback, an unknown codepoint becomes
+                    // UNK and cannot participate in a BPE merge.
+                    .atomic = !known,
+                });
+                if (node_index > 0) nodes.items[@intCast(node_index - 1)].next = node_index;
+            }
+            idx = end;
+        }
+
+        var heap: SpBpeHeap = .initContext({});
+        defer heap.deinit(allocator);
+        if (nodes.items.len > 1) {
+            for (0..nodes.items.len - 1) |j| {
+                try self.spPushCand(allocator, &heap, nodes.items, input, @intCast(j), @intCast(j + 1));
+            }
+        }
+
+        while (heap.pop()) |candidate| {
+            const ns = nodes.items;
+            if (ns[candidate.left].ver != candidate.lver or
+                ns[candidate.right].ver != candidate.rver)
+            {
+                continue;
+            }
+
+            ns[candidate.left].end = ns[candidate.right].end;
+            ns[candidate.left].ver += 1;
+            ns[candidate.right].ver += 1;
+            ns[candidate.left].next = ns[candidate.right].next;
+            if (ns[candidate.right].next >= 0) {
+                ns[@intCast(ns[candidate.right].next)].prev = @intCast(candidate.left);
+            }
+
+            if (ns[candidate.left].prev >= 0) {
+                try self.spPushCand(
+                    allocator,
+                    &heap,
+                    ns,
+                    input,
+                    @intCast(ns[candidate.left].prev),
+                    candidate.left,
+                );
+            }
+            if (ns[candidate.left].next >= 0) {
+                try self.spPushCand(
+                    allocator,
+                    &heap,
+                    ns,
+                    input,
+                    candidate.left,
+                    @intCast(ns[candidate.left].next),
+                );
+            }
+        }
+
+        var ids: std.ArrayList(u32) = .empty;
+        errdefer ids.deinit(allocator);
+        var cur: i32 = if (nodes.items.len > 0) 0 else -1;
+        while (cur >= 0) : (cur = nodes.items[@intCast(cur)].next) {
+            const node = nodes.items[@intCast(cur)];
+            if (node.fallback_byte) |byte| {
+                const id = state.byte_ids[byte] orelse return error.InvalidSentencePieceModel;
+                try ids.append(allocator, id);
+            } else {
+                const symbol = input[node.start..node.end];
+                try ids.append(allocator, self.vocab.get(symbol) orelse state.unk_id);
+            }
+        }
         return ids.toOwnedSlice(allocator);
     }
 };
@@ -1168,7 +1503,10 @@ pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_dir});
     defer allocator.free(path);
 
-    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| {
+        if (err == error.FileNotFound) return loadSentencePieceTokenizer(io, allocator, model_dir);
+        return err;
+    };
     defer file.close(io);
 
     var read_buf: [4096]u8 = undefined;
@@ -1176,6 +1514,30 @@ pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     const content = try reader_state.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(content);
     return parseTokenizerContent(io, allocator, content);
+}
+
+fn loadSentencePieceTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
+    const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.model", .{model_dir});
+    defer allocator.free(path);
+    const content = try readFileAllocTok(io, allocator, path);
+    defer allocator.free(content);
+
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
+    defer allocator.free(config_path);
+    const config_content = std.Io.Dir.openFileAbsolute(io, config_path, .{}) catch |err| {
+        if (err == error.FileNotFound) return parseSentencePieceContent(allocator, content);
+        return err;
+    };
+    defer config_content.close(io);
+    var config_read_buf: [4096]u8 = undefined;
+    var config_reader = config_content.reader(io, &config_read_buf);
+    const config_bytes = try config_reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024));
+    defer allocator.free(config_bytes);
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{});
+    defer parsed_config.deinit();
+    const specs = try collectNativeSpecialSpecs(allocator, parsed_config.value);
+    defer allocator.free(specs);
+    return parseSentencePieceContentWithSpecials(allocator, content, specs);
 }
 
 /// Load a byte-level BPE tokenizer from the SLOW HF format (`vocab.json` +
@@ -1386,6 +1748,234 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
     };
     if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
     return built;
+}
+
+fn collectNativeSpecialSpecs(allocator: std.mem.Allocator, value: std.json.Value) ![]NativeSpecialSpec {
+    if (value != .object) return error.InvalidTokenizerConfig;
+    var specs: std.ArrayList(NativeSpecialSpec) = .empty;
+    errdefer specs.deinit(allocator);
+
+    if (value.object.get("added_tokens_decoder")) |decoder| {
+        if (decoder != .object) return error.InvalidTokenizerConfig;
+        var it = decoder.object.iterator();
+        while (it.next()) |entry| {
+            const id = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch return error.InvalidTokenizerConfig;
+            const obj = entry.value_ptr.*;
+            if (obj != .object) return error.InvalidTokenizerConfig;
+            const content = jsonTokenContent(obj.object.get("content") orelse return error.InvalidTokenizerConfig) orelse
+                return error.InvalidTokenizerConfig;
+            const flagged = if (obj.object.get("special")) |special|
+                special == .bool and special.bool
+            else
+                false;
+            try appendNativeSpecialSpec(&specs, allocator, id, content, flagged);
+        }
+    }
+
+    if (value.object.get("additional_special_tokens")) |additional| {
+        if (additional != .array) return error.InvalidTokenizerConfig;
+        for (additional.array.items) |entry| {
+            const content = jsonTokenContent(entry) orelse return error.InvalidTokenizerConfig;
+            try appendNativeSpecialSpec(&specs, allocator, null, content, true);
+        }
+    }
+
+    // These fields are passed to PreTrainedTokenizer's constructor even when
+    // a checkpoint omits an added_tokens_decoder entry for one of them.
+    for ([_][]const u8{ "unk_token", "bos_token", "eos_token", "pad_token" }) |name| {
+        if (value.object.get(name)) |entry| {
+            const content = jsonTokenContent(entry) orelse return error.InvalidTokenizerConfig;
+            try appendNativeSpecialSpec(&specs, allocator, null, content, true);
+        }
+    }
+
+    std.mem.sort(NativeSpecialSpec, specs.items, {}, struct {
+        fn lessThan(_: void, a: NativeSpecialSpec, b: NativeSpecialSpec) bool {
+            if (a.id != null and b.id != null and a.id.? != b.id.?) return a.id.? < b.id.?;
+            if (a.id != null) return true;
+            if (b.id != null) return false;
+            return std.mem.lessThan(u8, a.content, b.content);
+        }
+    }.lessThan);
+    return specs.toOwnedSlice(allocator);
+}
+
+fn jsonTokenContent(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        .object => |obj| blk: {
+            const content = obj.get("content") orelse break :blk null;
+            break :blk if (content == .string) content.string else null;
+        },
+        else => null,
+    };
+}
+
+fn appendNativeSpecialSpec(
+    specs: *std.ArrayList(NativeSpecialSpec),
+    allocator: std.mem.Allocator,
+    id: ?u32,
+    content: []const u8,
+    flagged: bool,
+) !void {
+    if (content.len == 0) return;
+    for (specs.items) |*existing| {
+        if (!std.mem.eql(u8, existing.content, content)) continue;
+        if (existing.id != null and id != null and existing.id.? != id.?) {
+            return error.InvalidTokenizerConfig;
+        }
+        if (existing.id == null) existing.id = id;
+        existing.flagged = existing.flagged or flagged;
+        return;
+    }
+    try specs.append(allocator, .{ .id = id, .content = content, .flagged = flagged });
+}
+
+fn parseSentencePieceContent(allocator: std.mem.Allocator, content: []const u8) !Tokenizer {
+    return parseSentencePieceContentWithSpecials(allocator, content, null);
+}
+
+fn parseSentencePieceContentWithSpecials(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    native_specs: ?[]const NativeSpecialSpec,
+) !Tokenizer {
+    var model = try sentencepiece_proto.parse(allocator, content);
+    defer model.deinit();
+
+    if (model.unk_id >= model.pieces.len) return error.InvalidSentencePieceModel;
+    var has_unk = false;
+    for (model.pieces, 0..) |piece, id| {
+        if (piece.kind == .unknown and id == model.unk_id) {
+            has_unk = true;
+            break;
+        }
+    }
+    if (!has_unk) return error.InvalidSentencePieceModel;
+
+    var tok = Tokenizer.initEmptyForTests(allocator, .sentencepiece_bpe);
+    errdefer tok.deinit();
+    tok.bos_id = model.bos_id;
+    tok.eos_id = model.eos_id;
+    tok.sentencepiece = .{
+        .scores = std.StringHashMap(f32).init(allocator),
+        .user_defined = std.StringHashMap(u32).init(allocator),
+        .types = try allocator.alloc(sentencepiece_proto.PieceType, model.pieces.len),
+        .byte_ids = @splat(null),
+        .byte_fallback = model.byte_fallback,
+        .unk_id = model.unk_id,
+        .add_dummy_prefix = model.add_dummy_prefix,
+    };
+    try tok.vocab.ensureTotalCapacity(@intCast(model.pieces.len));
+    try tok.id_to_token.ensureTotalCapacity(@intCast(model.pieces.len));
+    try tok.sentencepiece.?.scores.ensureTotalCapacity(@intCast(model.pieces.len));
+    try tok.sentencepiece.?.user_defined.ensureTotalCapacity(@intCast(model.pieces.len));
+
+    var flagged: std.ArrayList(FlaggedSpecial) = .empty;
+    errdefer {
+        for (flagged.items) |special| allocator.free(special.content);
+        flagged.deinit(allocator);
+    }
+
+    for (model.pieces, 0..) |piece, id| {
+        const token_id: u32 = @intCast(id);
+        if (tok.vocab.contains(piece.text)) return error.InvalidSentencePieceModel;
+
+        const token = try allocator.dupe(u8, piece.text);
+        var token_in_vocab = false;
+        errdefer if (!token_in_vocab) allocator.free(token);
+        try tok.vocab.put(token, token_id);
+        token_in_vocab = true;
+        try tok.id_to_token.put(token_id, token);
+        tok.sentencepiece.?.types[id] = piece.kind;
+
+        switch (piece.kind) {
+            .normal => try tok.sentencepiece.?.scores.put(token, piece.score),
+            .user_defined => {
+                try tok.sentencepiece.?.user_defined.put(token, token_id);
+                if (isReservedNativeUserPiece(piece.text)) {
+                    try appendNativeFlagged(&flagged, allocator, token_id, piece.text);
+                }
+            },
+            .byte => {
+                const byte = sentencePieceByteValue(piece.text) orelse return error.InvalidSentencePieceModel;
+                if (tok.sentencepiece.?.byte_ids[byte] != null) return error.InvalidSentencePieceModel;
+                tok.sentencepiece.?.byte_ids[byte] = token_id;
+            },
+            .control => {
+                try putOwnedNativeSpecial(&tok, allocator, piece.text, token_id);
+                try appendNativeFlagged(&flagged, allocator, token_id, piece.text);
+            },
+            .unknown => {},
+        }
+    }
+
+    if (model.byte_fallback) {
+        for (tok.sentencepiece.?.byte_ids) |id| {
+            if (id == null) return error.InvalidSentencePieceModel;
+        }
+    }
+    if (native_specs) |specs| {
+        tok.encode_special_tokens = std.StringHashMap(u32).init(allocator);
+        for (specs) |spec| {
+            const id = spec.id orelse tok.vocab.get(spec.content) orelse return error.InvalidTokenizerConfig;
+            const actual = tok.id_to_token.get(id) orelse return error.InvalidTokenizerConfig;
+            if (!std.mem.eql(u8, actual, spec.content)) return error.InvalidTokenizerConfig;
+            if (!tok.special_tokens.contains(spec.content)) {
+                try putOwnedNativeSpecial(&tok, allocator, spec.content, id);
+            }
+            const key = try allocator.dupe(u8, spec.content);
+            var key_in_map = false;
+            errdefer if (!key_in_map) allocator.free(key);
+            try tok.encode_special_tokens.?.put(key, id);
+            key_in_map = true;
+            if (spec.flagged) {
+                try appendNativeFlagged(&flagged, allocator, id, spec.content);
+            }
+        }
+    }
+    tok.flagged_specials = try flagged.toOwnedSlice(allocator);
+    flagged = .empty;
+
+    log.info("Tokenizer loaded: {d} vocab, native SentencePiece BPE (byte_fallback={})\n", .{
+        tok.vocab.count(),
+        model.byte_fallback,
+    });
+    return tok;
+}
+
+fn putOwnedNativeSpecial(tok: *Tokenizer, allocator: std.mem.Allocator, text: []const u8, id: u32) !void {
+    const key = try allocator.dupe(u8, text);
+    errdefer allocator.free(key);
+    try tok.special_tokens.put(key, id);
+}
+
+fn appendNativeFlagged(flagged: *std.ArrayList(FlaggedSpecial), allocator: std.mem.Allocator, id: u32, text: []const u8) !void {
+    for (flagged.items) |existing| {
+        if (existing.id == id) return;
+    }
+    const content = try allocator.dupe(u8, text);
+    var content_in_list = false;
+    errdefer if (!content_in_list) allocator.free(content);
+    try flagged.append(allocator, .{ .id = id, .content = content });
+    content_in_list = true;
+}
+
+fn isReservedNativeUserPiece(text: []const u8) bool {
+    if (text.len <= 9 or !std.mem.startsWith(u8, text, "<reserve") or text[text.len - 1] != '>') return false;
+    const digits = text[8 .. text.len - 1];
+    if (digits.len == 0) return false;
+    for (digits) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
+}
+
+fn sentencePieceByteValue(text: []const u8) ?u8 {
+    if (text.len != 6 or text[0] != '<' or text[1] != '0' or text[2] != 'x' or text[5] != '>') return null;
+    const hi = std.fmt.charToDigit(text[3], 16) catch return null;
+    const lo = std.fmt.charToDigit(text[4], 16) catch return null;
+    return (@as(u8, hi) << 4) | lo;
 }
 
 /// Digits per pre-token from the tokenizer.json `pre_tokenizer` spec: a
@@ -2076,7 +2666,8 @@ test "gpt2PreTokenize: full Python snippet matches HF reference" {
     // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
     // the punct run. The byte-level encode + BPE merge stage downstream
     // turns this into exactly the same token-ids HF produces.
-    try expectPreTokens(testing.allocator,
+    try expectPreTokens(
+        testing.allocator,
         "def total(items):\n    total = 0",
         &.{ "def", " total", "(items", "):\n", "   ", " total", " =", " ", "0" },
     );
@@ -2375,7 +2966,7 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
     defer tok.deinit();
     const specials = [_][]const u8{
-        "<ifm|think>",      "</ifm|think>",      "<ifm|think_fast>",   "</ifm|think_fast>",
+        "<ifm|think>",        "</ifm|think>",        "<ifm|think_fast>", "</ifm|think_fast>",
         "<ifm|think_faster>", "</ifm|think_faster>", "<ifm|tool_calls>", "</ifm|tool_calls>",
     };
     for (specials, 0..) |t, i| {
@@ -2389,4 +2980,184 @@ test "markerCloserFor: K2 think openers pair with their own closer" {
     try testing.expectEqual(@as(?u32, 5), tok.markerCloserFor(4));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(6));
     try testing.expectEqual(@as(?u32, null), tok.markerCloserFor(1));
+}
+
+test "SentencePiece model fallback loads BPE scores, user symbols, bytes, and controls" {
+    const allocator = testing.allocator;
+
+    // Small wire-format fixture.  It exercises the parts that tokenizer.model
+    // adds beyond tokenizer.json: score-priority BPE, user-defined barriers,
+    // byte fallback, the dummy metaspace prefix, and control markers.
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(allocator);
+
+    const appendVarint = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, value: u64) !void {
+            var v = value;
+            while (v >= 0x80) : (v >>= 7) try buf.append(a, @as(u8, @truncate(v)) | 0x80);
+            try buf.append(a, @truncate(v));
+        }
+    }.put;
+    const appendField = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, field_no: u32, wire: u8, payload: []const u8) !void {
+            try appendVarint(buf, a, (@as(u64, field_no) << 3) | wire);
+            if (wire == 2) try appendVarint(buf, a, payload.len);
+            try buf.appendSlice(a, payload);
+        }
+    }.put;
+    const appendVarintField = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, field_no: u32, value: u64) !void {
+            try appendVarint(buf, a, (@as(u64, field_no) << 3) | 0);
+            try appendVarint(buf, a, value);
+        }
+    }.put;
+    const appendStringField = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, field_no: u32, value: []const u8) !void {
+            try appendField(buf, a, field_no, 2, value);
+        }
+    }.put;
+    const appendFloatField = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, field_no: u32, value: f32) !void {
+            try appendVarint(buf, a, (@as(u64, field_no) << 3) | 5);
+            const bits: u32 = @bitCast(value);
+            for (0..4) |shift| try buf.append(a, @truncate(bits >> @as(u5, @intCast(shift * 8))));
+        }
+    }.put;
+    const appendPiece = struct {
+        fn put(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, score: f32, kind: u64) !void {
+            var piece: std.ArrayList(u8) = .empty;
+            defer piece.deinit(a);
+            try appendStringField(&piece, a, 1, text);
+            try appendFloatField(&piece, a, 2, score);
+            try appendVarintField(&piece, a, 3, kind);
+            try appendField(buf, a, 1, 2, piece.items);
+        }
+    }.put;
+
+    try appendPiece(&model, allocator, "<_unk>", 0, 2);
+    try appendPiece(&model, allocator, "<_start>", 0, 3);
+    try appendPiece(&model, allocator, "<_end>", 0, 3);
+    try appendPiece(&model, allocator, "▁", 0, 1);
+    try appendPiece(&model, allocator, "a", -1, 1);
+    try appendPiece(&model, allocator, "b", -2, 1);
+    try appendPiece(&model, allocator, "ab", -3, 1);
+    try appendPiece(&model, allocator, "▁a", -4, 1);
+    try appendPiece(&model, allocator, "1", 0, 4);
+    try appendPiece(&model, allocator, "\n", 0, 4);
+    try appendPiece(&model, allocator, "<think>", 0, 3);
+    try appendPiece(&model, allocator, "<0xE2>", 0, 6);
+    try appendPiece(&model, allocator, "<0x98>", 0, 6);
+    try appendPiece(&model, allocator, "<0x83>", 0, 6);
+    var byte_piece: [6]u8 = .{ '<', '0', 'x', '0', '0', '>' };
+    const hex = "0123456789ABCDEF";
+    for (0..256) |byte| {
+        if (byte == 0xE2 or byte == 0x98 or byte == 0x83) continue;
+        byte_piece[3] = hex[byte >> 4];
+        byte_piece[4] = hex[byte & 0x0F];
+        try appendPiece(&model, allocator, &byte_piece, 0, 6);
+    }
+    try appendPiece(&model, allocator, "<reserve1>", 0, 4);
+
+    var trainer: std.ArrayList(u8) = .empty;
+    defer trainer.deinit(allocator);
+    try appendVarintField(&trainer, allocator, 3, 2); // BPE
+    try appendVarintField(&trainer, allocator, 35, 1); // byte_fallback
+    try appendVarintField(&trainer, allocator, 40, 0); // unk_id
+    try appendVarintField(&trainer, allocator, 41, 1); // bos_id
+    try appendVarintField(&trainer, allocator, 42, 2); // eos_id
+    try appendVarintField(&trainer, allocator, 43, 3); // pad_id
+    try appendField(&model, allocator, 2, 2, trainer.items);
+
+    var normalizer: std.ArrayList(u8) = .empty;
+    defer normalizer.deinit(allocator);
+    try appendStringField(&normalizer, allocator, 1, "identity");
+    try appendVarintField(&normalizer, allocator, 3, 1); // add_dummy_prefix
+    try appendVarintField(&normalizer, allocator, 4, 0); // preserve whitespace
+    try appendVarintField(&normalizer, allocator, 5, 1); // escape spaces
+    try appendField(&model, allocator, 3, 2, normalizer.items);
+
+    var tok = try parseSentencePieceContent(allocator, model.items);
+    defer tok.deinit();
+
+    {
+        const ids = try tok.encode(allocator, "ab");
+        defer allocator.free(ids);
+        // `ab` outranks `▁a` by score, so the prefix stays separate.
+        try testing.expectEqualSlices(u32, &[_]u32{ 3, 6 }, ids);
+    }
+    {
+        const ids = try tok.encode(allocator, "a1b");
+        defer allocator.free(ids);
+        // User-defined `1` is atomic and blocks BPE merges across it.
+        try testing.expectEqualSlices(u32, &[_]u32{ 7, 8, 5 }, ids);
+    }
+    {
+        const ids = try tok.encode(allocator, "<think>ab");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 10, 3, 6 }, ids);
+    }
+    {
+        const ids = try tok.encode(allocator, "☃");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 3, 11, 12, 13 }, ids);
+    }
+    {
+        const raw = [_]u8{ 0x00, 0xFF };
+        const ids = try tok.encode(allocator, &raw);
+        defer allocator.free(ids);
+        const round_trip = try tok.decode(allocator, ids, true);
+        defer allocator.free(round_trip);
+        try testing.expectEqualSlices(u8, &raw, round_trip);
+    }
+    {
+        const ids = [_]u32{ 7, 8, 5 };
+        const text = try tok.decode(allocator, &ids, true);
+        defer allocator.free(text);
+        try testing.expectEqualStrings("a1b", text);
+    }
+
+    var configured = try parseSentencePieceContentWithSpecials(allocator, model.items, &[_]NativeSpecialSpec{
+        .{ .id = 10, .content = "<think>", .flagged = true },
+    });
+    defer configured.deinit();
+    {
+        const ids = try configured.encode(allocator, "<think>ab");
+        defer allocator.free(ids);
+        try testing.expectEqualSlices(u32, &[_]u32{ 10, 3, 6 }, ids);
+    }
+    {
+        const ids = [_]u32{10};
+        const text = try configured.decode(allocator, &ids, false);
+        defer allocator.free(text);
+        try testing.expectEqualStrings("<think>", text);
+    }
+    {
+        const reserve_id = configured.vocab.get("<reserve1>") orelse unreachable;
+        const reserved = try configured.reservedIds(allocator, "<think>", &[_]u32{2});
+        defer allocator.free(reserved);
+        // Control/padding and reserve pieces are suppression candidates even
+        // when only `<think>` is in the configured input-interception set.
+        try testing.expectEqualSlices(u32, &[_]u32{ 1, reserve_id }, reserved);
+    }
+    {
+        // CONTROL metadata remains discoverable, but an unconfigured spelling
+        // follows ordinary SentencePiece text rather than being intercepted.
+        try testing.expectEqual(@as(?u32, 1), configured.specialTokenId("<_start>"));
+        const ids = try configured.encode(allocator, "<_start>");
+        defer allocator.free(ids);
+        try testing.expect(ids.len > 1);
+        try testing.expect(!std.mem.eql(u32, &[_]u32{1}, ids));
+    }
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.model", .data = model.items });
+    var path_buf: [512]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    var loaded = try loadTokenizer(io, allocator, path_buf[0..path_len]);
+    defer loaded.deinit();
+    const loaded_ids = try loaded.encode(allocator, "a1b");
+    defer allocator.free(loaded_ids);
+    try testing.expectEqualSlices(u32, &[_]u32{ 7, 8, 5 }, loaded_ids);
 }

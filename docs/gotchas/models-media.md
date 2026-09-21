@@ -2,6 +2,21 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Xing: a rotary width is not a stored attention head
+
+The original BF16 checkpoint failed before inference: omitted `rope_interleave`
+was treated as false instead of the reference's true default, and the loader
+expected JSON tokenization and converted weight names. Native ModelProto loading
+and in-memory weight preparation make the original directory loadable.
+The forward also confused the 64-wide rotary slice with the 192-wide stored key:
+KV staging was underbilled, and YaRN scaled only rotary channels rather than the
+whole attention score. mHC gains and products must round back to BF16 at the
+reference boundaries; MoE routing and the weighted expert sum instead stay f32.
+The fix separates those contracts and evaluates the layer loop at the cadence
+used by admission. Guards: config/weight/dtype unit tests, a tiny original-layout
+CPU-reference fixture through prefill and position-4096 cached decode, and
+`tests/test_xing4.py` against the full BF16 checkpoint.
+
 ### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
 
 Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).

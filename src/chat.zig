@@ -226,7 +226,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     // not be served at all.
     const a = std.testing.allocator;
 
-    {   // the shape that panicked: pick the entry named "default"
+    { // the shape that panicked: pick the entry named "default"
         const json =
             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
             \\{"name":"default","template":"PLAIN"}]}
@@ -235,22 +235,25 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // no "default" named: fall back to the first usable entry
-        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+    { // no "default" named: fall back to the first usable entry
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // the ordinary string shape is untouched
-        const json = \\{"chat_template":"BARE"}
+    { // the ordinary string shape is untouched
+        const json =
+            \\{"chat_template":"BARE"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // junk shapes return null so the caller uses its jinja/family fallback
-        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+    { // junk shapes return null so the caller uses its jinja/family fallback
+        const json =
+            \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -258,27 +261,30 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     }
     try std.testing.expect(chatTemplateFromValue(null) == null);
 
-    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
+    { // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
         // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
         // taking the pointer literally fails the render and SILENTLY drops to
         // the generic fallback — wrong-family markers the model then echoes.
         // Read it as "no inline template" so the sidecar file is used.
-        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        const json =
+            \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // whitespace/dash variants are the same pointer
-        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+    { // whitespace/dash variants are the same pointer
+        const json =
+            \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // a real template that merely CONTAINS the word include is untouched
-        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+    { // a real template that merely CONTAINS the word include is untouched
+        const json =
+            \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -372,7 +378,6 @@ pub fn formatChat(
 ) ![]u32 {
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
-
 
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
@@ -2387,7 +2392,7 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
     {
         return " to=user<|message|>";
     }
-    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
+    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64..], "\n\r\t ");
     if (k2ThinkOpenerAt(tail)) |opener| {
         inline for (k2_think_openers) |o| {
             if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
@@ -2773,21 +2778,30 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // of these into a real tool open. Order doesn't matter; first endsWith
     // hit wins. Listed shortest-first for legibility.
     const tail_prefixes = [_][]const u8{
-        "<",     "<t",     "<to",     "<too",     "<tool",
-        "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
-        "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        "<",        "<t",        "<to",       "<too",       "<tool",
+        "<|",       "<|t",       "<|to",      "<|too",      "<|tool",
+        "<|tool_",  "<|tool_c",  "<|tool_ca", "<|tool_cal",
         // MiniCPM5 V3 `<function name="…">` — COMPLETE ladder. `<funct` is a
         // real decomposition in this vocabulary (`<f` id 54303 + `unct` id
         // 14185 decode to exactly `<funct`); omitting that one rung flushed the
         // fragment and leaked the rest of the tag. The rungs are DERIVED in the
         // test, so a future gap fails there instead of shipping.
-        "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
+        "<f",
+        "<fu",      "<fun",      "<func",     "<funct",     "<functi",
+        "<functio", "<function",
         // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
-        "<a", "<at", "<ate", "<atem", "<atem:",
+        "<a",        "<at",        "<ate",
+        "<atem",    "<atem:",
         // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
         // splits too in case the tokenizer spells the marker in pieces)
-        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
-        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+           "<\xef",     "<\xef\xbd",
+        "<｜",
+        "<｜D",
+        "<｜DS",
+        "<｜DSM",
+        "<｜DSML",
+        "<｜DSML\xef",
+        "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -3193,12 +3207,12 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // distinctive marker no other family emits, and the generic `<tool` scan
     // never sees it (the opener is `<|tool_call_start|>`, not `<|tool_call>`).
     try parsePythonicToolCalls(allocator, effective_text, &calls);
-    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
-    // families: its wrapper (`<tool_calls:opensource>`) would also trip the
-    // generic `<tool` scan below, which would misread the non-JSON
-    // arg_key/arg_value body. When it matched, the generic scans are skipped
-    // but the shared safety net at the bottom still runs.
-    try parseHy3ToolCalls(allocator, effective_text, &calls);
+    // Tag-pair formats are tried FIRST among the tag families: Hy3's wrapper
+    // (`<tool_calls:opensource>`) and Xing's bare `<tool_call>` would otherwise
+    // trip the generic `<tool` scan below, which would misread their non-JSON
+    // bodies. When a pair format matches, the generic scan is skipped but the
+    // shared safety net at the bottom still runs.
+    try parseTagPairToolCalls(allocator, effective_text, &calls);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -3216,10 +3230,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
         // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
         // we see `_call|`. Let the Gemma 4 branch below pick this up.
-        if (next == '_'
-            and after_tool + 6 <= effective_text.len
-            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
-        {
+        if (next == '_' and after_tool + 6 <= effective_text.len and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|")) {
             search_pos = after_tool + 6;
             continue;
         }
@@ -4456,7 +4467,7 @@ fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, argume
         var w: usize = k + 1;
         while (w < slice.len and (slice[w] == ' ' or slice[w] == '\t' or slice[w] == '\n' or slice[w] == '\r')) w += 1;
         const close_markers = [_][]const u8{
-            "</tool_call>",   "</tool_calls>",
+            "</tool_call>",    "</tool_calls>",
             "</tool_request>", "</tool_requests>",
             "</tool>",
         };
@@ -4660,24 +4671,172 @@ fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch null;
 }
 
-/// Hy3 (Hunyuan 3) tag-format tool calls (chat_template.jinja spec):
-///   <tool_calls:SFX>
-///   <tool_call:SFX>NAME<tool_sep:SFX>
-///   <arg_key:SFX>KEY</arg_key:SFX>
-///   <arg_value:SFX>VALUE</arg_value:SFX> …
-///   </tool_call:SFX> …
-///   </tool_calls:SFX>
-/// Only the SUFFIXED form (`<tool_call:` …) is handled here — bare
-/// `<tool_call>` is Hermes JSON and stays with the generic scan. Values are
-/// kept as RAW STRINGS: the template `tojson`s non-string values on the way
-/// in, and the schema-driven coercion at the server chokepoint types them on
-/// the way back (types come from the SCHEMA, never the value's spelling).
-/// Args build through ObjectMap + Stringify — keys escaped, duplicates
-/// first-wins — per the tag-format-converter class rule. Truncation
-/// (max_tokens mid-call, the big-file-write class): a call whose name is
-/// delimited by `<tool_sep` recovers with its CLOSED key/value pairs only;
-/// partial values are never salvaged.
-/// Earliest position at/after `from` where any of `needles` occurs, or null.
+const TagPairToolFormat = struct {
+    key_open: []const u8,
+    key_close: []const u8,
+    value_open: []const u8,
+    value_close: []const u8,
+    /// Hy3 appends `:release` to every control tag. Xing uses bare tags.
+    suffixed: bool,
+};
+
+const glm_bare_pair_format = TagPairToolFormat{
+    .key_open = "<arg_key",
+    .key_close = "</arg_key",
+    .value_open = "<arg_value",
+    .value_close = "</arg_value",
+    .suffixed = false,
+};
+
+const hy3_pair_format = TagPairToolFormat{
+    .key_open = "<arg_key",
+    .key_close = "</arg_key",
+    .value_open = "<arg_value",
+    .value_close = "</arg_value",
+    .suffixed = true,
+};
+
+const xing_pair_format = TagPairToolFormat{
+    .key_open = "<param_key",
+    .key_close = "</param_key",
+    .value_open = "<param_value",
+    .value_close = "</param_value",
+    .suffixed = false,
+};
+
+/// Match one tag from a format whose base is known at run time. This is the
+/// shared matcher for GLM/Hy3 `arg_*` and Xing `param_*` tags.
+fn pairTagLenAt(text: []const u8, base: []const u8, suffixed: bool) ?usize {
+    if (!std.mem.startsWith(u8, text, base)) return null;
+    var i = base.len;
+    if (i < text.len and text[i] == '>') return i + 1;
+    if (!suffixed or i >= text.len or text[i] != ':') return null;
+    i += 1;
+    const suffix_start = i;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '>') return if (i > suffix_start) i + 1 else null;
+        if (!tagSuffixChar(c)) return null;
+    }
+    return null;
+}
+
+/// Find the first complete tag whose base is in `bases`.
+fn firstPairTag(
+    text: []const u8,
+    from: usize,
+    bases: []const []const u8,
+    suffixed: bool,
+) ?TagAt {
+    var scan = from;
+    while (scan < text.len) {
+        const pos = earliestIndexOfAny(text, scan, bases) orelse return null;
+        for (bases) |base| {
+            if (std.mem.startsWith(u8, text[pos..], base)) {
+                if (pairTagLenAt(text[pos..], base, suffixed)) |len| {
+                    return .{ .pos = pos, .len = len };
+                }
+            }
+        }
+        scan = pos + 1;
+    }
+    return null;
+}
+
+/// Find the next complete key/value opener. A value may mention `<param_key>`
+/// or `<arg_key>` as prose; it is structural only when a key close and a value
+/// opener follow it.
+fn nextPairKey(
+    text: []const u8,
+    from: usize,
+    bound: usize,
+    format: TagPairToolFormat,
+) ?TagAt {
+    var scan = from;
+    while (std.mem.indexOfPos(u8, text, scan, format.key_open)) |pos| {
+        if (pos >= bound) return null;
+        const key_len = pairTagLenAt(text[pos..], format.key_open, format.suffixed) orelse {
+            scan = pos + format.key_open.len;
+            continue;
+        };
+        const key_close = firstPairTag(
+            text,
+            pos + key_len,
+            &.{ format.key_close, format.value_close },
+            format.suffixed,
+        ) orelse {
+            scan = pos + key_len;
+            continue;
+        };
+        if (key_close.pos >= bound) return null;
+        var value_start = key_close.pos + key_close.len;
+        while (value_start < text.len and std.ascii.isWhitespace(text[value_start])) value_start += 1;
+        if (pairTagLenAt(text[value_start..], format.value_open, format.suffixed) != null) {
+            return .{ .pos = pos, .len = key_len };
+        }
+        scan = pos + key_len;
+    }
+    return null;
+}
+
+/// Find the last complete value close before the next key or call close.
+///
+/// A value may contain the format's own close text. Taking the first close
+/// would truncate a file or command. The last close before the next structural
+/// marker is the confirmed delimiter for this tag family.
+fn pairValueEnd(
+    text: []const u8,
+    value_start: usize,
+    call_end: usize,
+    format: TagPairToolFormat,
+) ?TagAt {
+    const bound = if (nextPairKey(text, value_start, call_end, format)) |next_key|
+        next_key.pos
+    else
+        call_end;
+
+    var scan = value_start;
+    var best: ?TagAt = null;
+    while (std.mem.indexOfPos(u8, text, scan, format.value_close)) |pos| {
+        if (pos >= bound) break;
+        if (pairTagLenAt(text[pos..], format.value_close, format.suffixed)) |len| {
+            best = .{ .pos = pos, .len = len };
+        }
+        scan = pos + 1;
+    }
+    return best;
+}
+
+/// If `at` is inside a tag-pair value, return the byte after that value's
+/// confirmed close. This prevents wrapper-close text in a payload from ending
+/// the call before the actual `</tool_call>` delimiter.
+fn pairValueSpanEnclosing(text: []const u8, at: usize, format: TagPairToolFormat) ?usize {
+    const open = std.mem.lastIndexOf(u8, text[0..at], format.value_open) orelse return null;
+    const open_len = pairTagLenAt(text[open..], format.value_open, format.suffixed) orelse return null;
+    const value_start = open + open_len;
+    if (value_start >= at) return null;
+    const close = pairValueEnd(text, value_start, text.len, format) orelse return null;
+    if (close.pos <= at) return null;
+    return close.pos + close.len;
+}
+
+/// Find a complete `</tool_call>` outside all tag-pair values.
+fn pairToolCallClose(text: []const u8, from: usize, format: TagPairToolFormat) ?TagAt {
+    var scan = from;
+    while (std.mem.indexOfPos(u8, text, scan, "</tool_call")) |pos| {
+        const len = pairTagLenAt(text[pos..], "</tool_call", format.suffixed) orelse {
+            scan = pos + "</tool_call".len;
+            continue;
+        };
+        if (pairValueSpanEnclosing(text, pos, format)) |past| {
+            scan = past;
+            continue;
+        }
+        return .{ .pos = pos, .len = len };
+    }
+    return null;
+}
+
 fn isBareToolName(body: []const u8) bool {
     const name = std.mem.trim(u8, body, " \t\n\r");
     if (name.len == 0) return false;
@@ -5322,17 +5481,21 @@ fn parsePythonicToolCalls(allocator: std.mem.Allocator, text: []const u8, calls:
     }
 }
 
-fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+/// Parse the shared tag-pair dialects: suffixed Hy3 `arg_*`, bare GLM
+/// `arg_*`, and Xing4.0 `param_*`.
+fn parseTagPairToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, "<tool_call")) |p| {
         const after_base = p + "<tool_call".len;
         var name_start: usize = undefined;
+        var pair_format = glm_bare_pair_format;
         if (after_base < text.len and text[after_base] == ':') {
             // Canonical singular per-call opener `<tool_call:sfx>`.
             const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
                 pos = after_base;
                 continue;
             };
+            pair_format = hy3_pair_format;
             name_start = p + open_len;
         } else if (std.mem.startsWith(u8, text[p..], "<tool_calls:")) {
             // Suffixed plural WRAPPER `<tool_calls:sfx>` (hy3 only — the BARE
@@ -5356,6 +5519,7 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
                 pos = p + wrap_len;
                 continue;
             }
+            pair_format = hy3_pair_format;
             name_start = p + wrap_len;
         } else if (after_base < text.len and text[after_base] == '>' and blk: {
             // Bare `<tool_call>` has two sub-formats sharing this opener:
@@ -5363,16 +5527,24 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
             //     → the generic scan reads those; fall through.
             //   • GLM (Laguna, tokenizer tool_parser_type "glm47"):
             //     `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
+            //   • Xing4.0:
+            //     `<tool_call>NAME<param_key>K</param_key><param_value>V</param_value>…`
             //     — bare opener, NAME, then arg_key/arg_value pairs, NO plural
-            //     wrapper. Route HERE only when an `<arg_key` precedes this
-            //     call's close (the unambiguous GLM signal a JSON/function body
+            //     wrapper. Route HERE only when a pair-key tag precedes this
+            //     call's close (the unambiguous signal a JSON/function body
             //     never has), so the Hermes path is untouched.
             const body = after_base + 1;
             const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
             const ak_at = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
-            // A parameterless GLM call has no <arg_key>: its whole body is
+            const pk_at = std.mem.indexOfPos(u8, text, body, "<param_key") orelse text.len;
+            const glm_signal = ak_at < this_close and isBareToolName(text[body..ak_at]);
+            const xing_signal = pk_at < this_close and isBareToolName(text[body..pk_at]);
+            if (xing_signal) {
+                pair_format = xing_pair_format;
+            }
+            // A parameterless GLM/Xing call has no pair key: its whole body is
             // the bare NAME, a shape neither the JSON nor `<function=` arms read.
-            break :blk ak_at < this_close or isBareToolName(text[body..this_close]);
+            break :blk glm_signal or xing_signal or isBareToolName(text[body..this_close]);
         }) {
             name_start = after_base + 1;
         } else {
@@ -5384,10 +5556,11 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         // NAME runs to the first structural marker after the opener. Canonically
         // that's <tool_sep:sfx>; a mangled call (weak model dropped <tool_sep> —
         // live 2026-07-16, Hy3-REAP62 via pi) instead closes the name with
-        // </arg_value>/<arg_key>/</tool_call>, so accept any of them. No marker
-        // at all → the cut happened inside the name; nothing to recover.
+        // a key/value close or </tool_call>. Accept both GLM/Hy3 arg tags and
+        // Xing param tags. No marker at all → the cut happened inside the name.
         const name_end = earliestIndexOfAny(text, name_start, &.{
-            "<tool_sep", "<arg_key", "<arg_value", "</tool_call", "</arg_key", "</arg_value",
+            "<tool_sep",   "<arg_key",  "<arg_value",  "<param_key",  "<param_value",
+            "</tool_call", "</arg_key", "</arg_value", "</param_key", "</param_value",
         }) orelse {
             pos = name_start;
             continue;
@@ -5408,36 +5581,37 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         if (suffixedTagLenAt(text[name_end..], "<tool_sep")) |sep_len| {
             i = name_end + sep_len;
         }
-        // Parse <arg_key>/<arg_value> pairs, bounded by this call's </tool_call>.
-        // SCAN to the next <arg_key> (rather than requiring it right here) so a
-        // stray name-close tag between the name and the first key is skipped, and
-        // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>) —
-        // REAP closes it with </arg_value> (live 2026-07-16 raw capture: bash /
-        // command / "ls -la"). The well-formed path is unchanged: its <tool_sep>
-        // is consumed above, <arg_key> is found immediately, and </arg_key> is the
-        // earliest close.
-        const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
+        // Parse the selected format's key/value pairs, bounded by this call's
+        // close. The close scan skips wrapper text inside a value and the value
+        // scan takes the LAST close before the next key, so file contents can
+        // document this very dialect without being truncated.
+        const call_close = pairToolCallClose(text, i, pair_format);
+        const call_end = if (call_close) |close| close.pos else text.len;
         while (true) {
-            const ak_at = std.mem.indexOfPos(u8, text, i, "<arg_key") orelse break;
+            const ak_at = std.mem.indexOfPos(u8, text, i, pair_format.key_open) orelse break;
             if (ak_at >= call_end) break;
-            const ak_len = suffixedTagLenAt(text[ak_at..], "<arg_key") orelse {
-                i = ak_at + "<arg_key".len;
+            const ak_len = pairTagLenAt(text[ak_at..], pair_format.key_open, pair_format.suffixed) orelse {
+                i = ak_at + pair_format.key_open.len;
                 continue;
             };
             const key_start = ak_at + ak_len;
-            const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
-            const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse
-                suffixedTagLenAt(text[ak_close..], "</arg_value") orelse break;
-            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
-            i = ak_close + ak_close_len;
+            const key_close = firstPairTag(
+                text,
+                key_start,
+                &.{ pair_format.key_close, pair_format.value_close },
+                pair_format.suffixed,
+            ) orelse break;
+            const key = std.mem.trim(u8, text[key_start..key_close.pos], " \t\n\r");
+            i = key_close.pos + key_close.len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-            const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
+            const av_len = pairTagLenAt(text[i..], pair_format.value_open, pair_format.suffixed) orelse break;
             const val_start = i + av_len;
-            const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
-            const av_close_len = suffixedTagLenAt(text[av_close..], "</arg_value") orelse break;
-            const value = text[val_start..av_close];
-            i = av_close + av_close_len;
+            const value_close = pairValueEnd(text, val_start, call_end, pair_format) orelse break;
+            const value = text[val_start..value_close.pos];
+            i = value_close.pos + value_close.len;
             if (key.len > 0 and args_map.getEntry(key) == null) {
+                // A raw string can itself spell JSON. Only the request's
+                // schema can disambiguate; preserve its bytes until then.
                 try args_map.put(allocator, key, .{ .string = value });
             }
         }
@@ -5448,12 +5622,7 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         errdefer allocator.free(name_owned);
         try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
 
-        if (std.mem.indexOfPos(u8, text, i, "</tool_call")) |cl| {
-            const cl_len = suffixedTagLenAt(text[cl..], "</tool_call") orelse 0;
-            pos = if (cl_len > 0) cl + cl_len else cl + "</tool_call".len;
-        } else {
-            pos = i;
-        }
+        pos = if (call_close) |close| close.pos + close.len else i;
     }
 }
 
@@ -6651,7 +6820,8 @@ fn stripHermesValueFraming(raw: []const u8) []const u8 {
 /// which the equals-sign form never produces (its char right after
 /// `<function` is always `=`), so the two can never false-fire on each
 /// other. Duplicate `<param name="K">` — first occurrence wins, mirroring
-/// `parseHermesToolCall`'s `<parameter=>` dedup and `parseHy3ToolCalls`'s
+/// `parseHermesToolCall`'s `<parameter=>` dedup and
+/// `parseTagPairToolCalls`'s
 /// `<arg_key>` dedup (both exist because std.json rejects duplicate object
 /// keys). An unrecognized function name or an undeclared parameter is never
 /// rejected here — schema validation is centralized downstream
@@ -6659,8 +6829,8 @@ fn stripHermesValueFraming(raw: []const u8) []const u8 {
 /// `parseToolCallsForRequest`), exactly as for every other tag-format
 /// dialect. Truncation (EOS or max_tokens mid-call): when no `</function>`
 /// close is found, the param scan is bounded by end-of-text instead — any
-/// COMPLETE `<param>…</param>` pairs before the cut still recover (mirrors
-/// `parseHy3ToolCalls`'s `call_end` fallback); a partial trailing value is
+/// COMPLETE `<param>…</param>` pairs before the cut still recover (mirrors the
+/// tag-pair parser's `call_end` fallback); a partial trailing value is
 /// never salvaged.
 fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
@@ -6992,8 +7162,7 @@ test "collapseDoubledThinkTags leaves single </think> unchanged" {
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
-    const out = try collapseDoubledThinkTags(testing.allocator,
-        "A</think></think>B</think></think>C");
+    const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
@@ -9699,8 +9868,7 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
     try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
-    try testing.expect(!templateConsumesEffort(
-        "{%- if enable_thinking %}<think>\n{%- endif %}"));
+    try testing.expect(!templateConsumesEffort("{%- if enable_thinking %}<think>\n{%- endif %}"));
     try testing.expect(!templateConsumesEffort(""));
 }
 
@@ -11106,7 +11274,7 @@ test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
     const allocator = testing.allocator;
     const text = "\n\n<tool_call>\n" ++
         \\{"name": "writeFile", "arguments": {"path": "vite.config.js", "content": "ok"}}
-        ++ "\n</tool_cal";
+    ++ "\n</tool_cal";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -11129,7 +11297,7 @@ test "parseToolCalls: mismatched </tool_action> close still parses" {
     const allocator = testing.allocator;
     const text = "<tool_call>\n" ++
         \\{"name": "edit", "arguments": {"path":"mlx.html", "edits":[{"oldText": "  </ul>\n</body>", "newText": "  </ul>\n  <button onclick=\"alert('Hello from MLX')\">Click me</button>\n</body>"}]}
-        ++ "\n</tool_action>";
+    ++ "\n</tool_action>";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -11590,11 +11758,13 @@ fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
 /// Value strings chosen to collide with every JSON literal spelling the
 /// tag-format parsers used to guess from.
 const adversarial_strings = [_][]const u8{
-    "false",      "true",         "False",   "True",    "null",   "None",
-    "42",         "-7",           "3.14",    "0",       "1",      "",
-    "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
-    "a\"b",       "line\nline",   "tab\there", "back\\slash", "café ☕", "0x1f",
-    "{not json",  "[unclosed",    "1e400",   "00",      "+5",     "-",
+    "false", "true",       "False",     "True",        "null", "None",
+    "42",    "-7",         "3.14",      "0",           "1",    "",
+    "[1,2]", "{\"k\":1}",  "nan",       "inf",         "  ",   "yes",
+    "a\"b",  "line\nline", "tab\there", "back\\slash",
+    "café ☕",
+    "0x1f",  "{not json",  "[unclosed", "1e400",       "00",   "+5",
+    "-",
 };
 
 test "fuzz: a conforming tool call round-trips byte-identical through parse+coerce" {
@@ -11659,8 +11829,7 @@ test "fuzz: a conforming tool call round-trips byte-identical through parse+coer
 
         // Serialize as a canonical Hermes JSON call — always VALID input.
         const args_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = args }, .{});
-        const raw = try std.fmt.allocPrint(arena,
-            "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
+        const raw = try std.fmt.allocPrint(arena, "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
 
         const calls = (try parseToolCalls(allocator, raw)) orelse {
             std.debug.print("\n[fuzz iter {d}] valid tool call did not parse\n  {s}\n", .{ iter, raw });
@@ -12398,6 +12567,114 @@ test "parseToolCalls hy3: suffixed think close before the wrapper still parses" 
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("list_files", calls[0].name);
+}
+
+test "parseToolCalls Xing4 param_key/param_value format preserves payload bytes" {
+    const raw = "<tool_call>write_file" ++
+        "<param_key>content</param_key><param_value>  first\n" ++
+        "</tool_call> is literal  \n</param_value>" ++
+        "</tool_call>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "  first\n</tool_call> is literal  \n",
+        parsed.value.object.get("content").?.string,
+    );
+}
+
+test "parseToolCalls Xing4 truncation keeps closed param pairs only" {
+    const raw = "<tool_call>write_file" ++
+        "<param_key>path</param_key><param_value>novel.txt</param_value>" ++
+        "<param_key>content</param_key><param_value>Chapter 1 starts but the";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("novel.txt", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Xing4 preserves JSON spelling until schema coercion" {
+    const raw = "<tool_call>configure" ++
+        "<param_key>settings</param_key><param_value>  {\"enabled\":true,\"items\":[1,2]}\n</param_value>" ++
+        "<param_key>note</param_key><param_value>mentions <param_key> but is text</param_value>" ++
+        "</tool_call>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const settings = parsed.value.object.get("settings").?;
+    try testing.expect(settings == .string);
+    try testing.expectEqualStrings("  {\"enabled\":true,\"items\":[1,2]}\n", settings.string);
+    try testing.expectEqualStrings(
+        "mentions <param_key> but is text",
+        parsed.value.object.get("note").?.string,
+    );
+}
+
+test "renderChatTemplate: REAL Xing4.0 template supports tools, history objects, and thinking (XING_MODEL_DIR)" {
+    // Env-gated against the original checkpoint because its sidecar template is
+    // the contract. The test exercises visible_text's macro/type branches,
+    // iterable/mapping checks, tojson(ensure_ascii=False), object arguments in
+    // assistant history, and both thinking prompt tails.
+    const dir = std.c.getenv("XING_MODEL_DIR") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
+    defer allocator.free(path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tpl = blk: {
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.SkipZigTest;
+        defer f.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = f.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    };
+    defer allocator.free(tpl);
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"北京时间","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_xing", .name = "get_time", .arguments = "{\"timezone\":\"北京\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 北京", .tool_call_id = "tc_xing" },
+    };
+
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<_system>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"get_time\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "北京时间") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\\u5317") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_call>get_time") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<param_key>timezone</param_key><param_value>北京</param_value>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>12:34 北京</tool_response>") != null);
+        try testing.expect(promptTailOpensThink(rendered));
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(!promptTailOpensThink(rendered));
+        try testing.expect(std.mem.endsWith(u8, rendered, "<_bot></think>"));
+    }
 }
 
 // ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
@@ -13584,7 +13861,6 @@ test "streamContentLead never touches whitespace inside the answer" {
     // whole, so its logprobs entry still describes bytes that reached content.
     try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
 }
-
 
 test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
     // A 4 KB edit call that hit EOS inside a string value. The object never

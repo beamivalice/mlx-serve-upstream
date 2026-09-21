@@ -401,6 +401,15 @@ pub const ModelConfig = struct {
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
 
+    // Xing's mHC surrounds both sublayers. Its Sinkhorn uses denominator
+    // eps, unlike DeepSeek-V4's probability offset; see docs/reference.md.
+    xing_hc: bool = false, // false = not a xing4_0 trunk
+    xing_hc_mult: u32 = 0, // stream count (hc ≤ 8: the mix buffers are fixed-width)
+    xing_hc_iters: u32 = 0, // Sinkhorn row/col normalization rounds
+    xing_hc_eps: f32 = 1e-6, // added to each sum BEFORE the division
+    xing_hc_clamp_min: f32 = -30, // comb-logit clamp bounds (pre-exp)
+    xing_hc_clamp_max: f32 = 30,
+
     // BERT encoder-only
     is_encoder_only: bool = false,
     layer_norm_eps: f32 = 1e-12,
@@ -952,6 +961,11 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
     }
 
+    /// Full MLA + MoE, with mHC residual streams around both sublayers.
+    pub fn isXing4(self: *const ModelConfig) bool {
+        return self.xing_hc and std.mem.eql(u8, self.model_type, "xing4_0");
+    }
+
     /// The long-context blast-radius predicate: every long-context mechanism (KV
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
@@ -1084,6 +1098,8 @@ pub const ModelConfig = struct {
         if (self.qk_scale_factor > 0)
             return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
         if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
+        if (self.isXing4() and self.rope_yarn)
+            return self.yarn_attention_factor * self.yarn_attention_factor / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
         return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
     }
 
@@ -2890,6 +2906,208 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // The MTP head ships disabled (num_nextn_predict_layers 0) and no
         // mtp.* weights are in the checkpoint. The single terminator
         // (`<|role_end|>`) rides the root eos_token_id — no additive merge.
+    } else if (std.mem.eql(u8, model_type, "xing4_0")) {
+        if (config.quant_bits != 0) {
+            log.err("xing4_0: only original BF16 checkpoints are supported\n", .{});
+            return error.UnsupportedXing4Config;
+        }
+        // Reference: configuration_xing4_0.py and modeling_xing4_0.py.
+        // MLA caches every layer; the residual is an mHC stream, not x + f(x).
+        config.model_type = "xing4_0";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false; // MLA norms the LATENTS, not the heads
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+
+        // MLA geometry (bailing's field set; xing has no linear layers, so
+        // full_attention_interval stays 0 and every layer binds .full).
+        if (cfg_obj.get("q_lora_rank")) |v| {
+            if (v == .integer) config.mla_q_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("kv_lora_rank")) |v| {
+            if (v == .integer) config.mla_kv_lora_rank = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_nope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_nope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| {
+            if (v == .integer) config.mla_qk_rope_head_dim = @intCast(v.integer);
+        }
+        if (cfg_obj.get("v_head_dim")) |v| {
+            if (v == .integer) config.mla_v_head_dim = @intCast(v.integer);
+        }
+        // Our head_dim bounds stored K/V; HF uses that name for only RoPE.
+        // Keep the YaRN table on the rotary slice without underbilling KV.
+        config.head_dim = @max(config.mlaQkHeadDim(), config.mla_v_head_dim);
+        if (config.head_dim == 0 or config.mla_qk_rope_head_dim == 0) return error.UnsupportedXing4Config;
+        config.partial_rotary_factor = @as(f32, @floatFromInt(config.mla_qk_rope_head_dim)) / @as(f32, @floatFromInt(config.head_dim));
+        config.partial_rotary_factor_global = config.partial_rotary_factor;
+        // Direct-Q and missing-KV-latent variants require different bindings.
+        if (config.mla_kv_lora_rank == 0) {
+            log.err("xing4_0: kv_lora_rank is required\n", .{});
+            return error.UnsupportedXing4Config;
+        }
+        if (config.mla_q_lora_rank == 0) {
+            log.err("xing4_0: q_lora_rank is required (direct q_proj MLA not supported)\n", .{});
+            return error.UnsupportedXing4Config;
+        }
+        // The score width and cached K must agree with NoPE + RoPE.
+        if (cfg_obj.get("qk_head_dim")) |v| {
+            if (v == .integer and @as(u32, @intCast(v.integer)) != config.mlaQkHeadDim()) {
+                log.err("xing4_0: qk_head_dim {d} != qk_nope_head_dim + qk_rope_head_dim ({d})\n", .{ v.integer, config.mlaQkHeadDim() });
+                return error.UnsupportedXing4Config;
+            }
+        }
+        // Attention scale is 1/sqrt(qk_head_dim) over the FULL query width,
+        // with the YaRN mscale² folded in by the forward (see above).
+        config.query_pre_attn_scalar = config.mlaQkHeadDim();
+        config.rope_interleaved_pairs = true;
+        if (cfg_obj.get("rope_interleave")) |v| {
+            if (v == .bool) config.rope_interleaved_pairs = v.bool;
+        }
+        // The reference rotates ADJACENT PAIRS in the interleave kernel; the
+        // halves-form (rope_interleave=false) would be served the wrong
+        // permutation of the same frequencies.
+        if (!config.rope_interleaved_pairs) {
+            log.err("xing4_0: rope_interleave must be true (halves-form RoPE not supported)\n", .{});
+            return error.UnsupportedXing4Config;
+        }
+        // Additive attention biases are not bound by the MLA loader.
+        if (cfg_obj.get("attention_bias")) |v| {
+            if (v == .bool and v.bool) {
+                log.err("xing4_0: attention_bias=true not supported\n", .{});
+                return error.UnsupportedXing4Config;
+            }
+        }
+
+        // The reference uses sigmoid + selection bias but no group masking.
+        config.moe_sigmoid_router = true;
+        if (cfg_obj.get("n_routed_experts")) |v| {
+            if (v == .integer) config.num_experts = @intCast(v.integer);
+        }
+        if (cfg_obj.get("first_k_dense_replace")) |v| {
+            if (v == .integer) config.first_k_dense_replace = @intCast(v.integer);
+        }
+        if (cfg_obj.get("moe_layer_freq")) |v| {
+            if (v == .integer and v.integer != 1) {
+                log.err("xing4_0: moe_layer_freq {d} not supported (every layer >= first_k_dense_replace is MoE)\n", .{v.integer});
+                return error.UnsupportedXing4Config;
+            }
+        }
+        if (cfg_obj.get("n_group")) |v| {
+            if (v == .integer) config.moe_n_group = @intCast(v.integer);
+        }
+        if (cfg_obj.get("topk_group")) |v| {
+            if (v == .integer) config.moe_topk_group = @intCast(v.integer);
+        }
+        if (config.moe_n_group > 1 or config.moe_topk_group > 1) {
+            log.err("xing4_0: grouped routing (n_group={d}, topk_group={d}) not supported — the reference router top-k's the biased scores directly\n", .{ config.moe_n_group, config.moe_topk_group });
+            return error.UnsupportedXing4Config;
+        }
+        if (cfg_obj.get("norm_topk_prob")) |v| {
+            if (v == .bool) config.moe_route_norm = v.bool;
+        }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("scoring_func")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) {
+                log.err("xing4_0: scoring_func '{s}' not supported (sigmoid only)\n", .{v.string});
+                return error.UnsupportedXing4Config;
+            }
+        }
+        if (cfg_obj.get("topk_method")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "noaux_tc")) {
+                log.err("xing4_0: topk_method '{s}' not supported (noaux_tc only)\n", .{v.string});
+                return error.UnsupportedXing4Config;
+            }
+        }
+        // Shared expert width = n_shared_experts × the routed expert width
+        // (both 1024 on the release); exactly one ungated shared expert.
+        if (cfg_obj.get("n_shared_experts")) |v| {
+            if (v == .integer) {
+                if (v.integer != 1) {
+                    log.err("xing4_0: n_shared_experts {d} not supported (exactly 1)\n", .{v.integer});
+                    return error.UnsupportedXing4Config;
+                }
+                config.shared_expert_intermediate_size =
+                    @as(u32, @intCast(v.integer)) * config.moe_intermediate_size;
+            }
+        } else {
+            config.shared_expert_intermediate_size = config.moe_intermediate_size;
+        }
+
+        // mHC per sublayer. The mix buffers in the forward are fixed-width
+        // for hc ≤ 8 (dsv4's parity), and 0/absent would divide the stream
+        // sum over nothing.
+        config.xing_hc = true;
+        if (cfg_obj.get("hc_mult")) |v| {
+            if (v == .integer) config.xing_hc_mult = @intCast(v.integer);
+        }
+        if (config.xing_hc_mult < 1 or config.xing_hc_mult > 8) {
+            log.err("xing4_0: hc_mult {d} out of range 1..8\n", .{config.xing_hc_mult});
+            return error.UnsupportedXing4Config;
+        }
+        if (cfg_obj.get("hc_sinkhorn_iters")) |v| {
+            if (v == .integer) config.xing_hc_iters = @intCast(v.integer);
+        }
+        if (config.xing_hc_iters == 0) {
+            log.err("xing4_0: hc_sinkhorn_iters must be >= 1\n", .{});
+            return error.UnsupportedXing4Config;
+        }
+        if (cfg_obj.get("hc_eps")) |v| config.xing_hc_eps = jsonFloat(v);
+        if (cfg_obj.get("mhc_h_res_clamp_min")) |v| config.xing_hc_clamp_min = jsonFloat(v);
+        if (cfg_obj.get("mhc_h_res_clamp_max")) |v| config.xing_hc_clamp_max = jsonFloat(v);
+
+        // Equal YaRN mscale parameters leave cos/sin unscaled; attnScale
+        // applies mscale_all_dim² to the entire score, including NoPE.
+        if (cfg_obj.get("rope_scaling")) |rs| {
+            if (rs == .object and blk: {
+                const rtype = rs.object.get("type");
+                break :blk rtype != null and rtype.? == .string and
+                    std.mem.eql(u8, rtype.?.string, "yarn");
+            }) {
+                const rsp = rs.object;
+                config.rope_yarn = true;
+                if (rsp.get("factor")) |x| config.yarn_factor = jsonFloat(x);
+                if (rsp.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
+                if (rsp.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
+                if (rsp.get("original_max_position_embeddings")) |x| {
+                    if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
+                }
+                if (config.yarn_orig_max_pos == 0) {
+                    log.err("xing4_0: rope_scaling.type=yarn needs original_max_position_embeddings (the ramp bounds come from it)\n", .{});
+                    return error.UnsupportedXing4Config;
+                }
+                if (rsp.get("attention_factor") != null) {
+                    log.err("xing4_0: explicit rope_scaling.attention_factor not supported (the reference derives the mscale fold from mscale_all_dim)\n", .{});
+                    return error.UnsupportedXing4Config;
+                }
+                const mscale_all_dim: f32 = if (rsp.get("mscale_all_dim")) |x| jsonFloat(x) else 0.0;
+                const mscale: f32 = if (rsp.get("mscale")) |x| jsonFloat(x) else mscale_all_dim;
+                if (mscale != mscale_all_dim) {
+                    log.err("xing4_0: rope_scaling mscale {d} != mscale_all_dim {d} would rescale cos/sin as well as the attention scale\n", .{ mscale, mscale_all_dim });
+                    return error.UnsupportedXing4Config;
+                }
+                // yarn_get_mscale(factor, mscale_all_dim); no fold at all
+                // when the checkpoint declares mscale_all_dim 0 (HF's
+                // `if mscale_all_dim:` guard).
+                config.yarn_attention_factor = if (mscale_all_dim > 0.0 and config.yarn_factor > 1.0)
+                    0.1 * mscale_all_dim * @log(config.yarn_factor) + 1.0
+                else
+                    1.0;
+            }
+        }
+        // kv_b_proj expands to all attention heads, not a GQA subset.
+        if (config.num_attention_heads != config.num_key_value_heads) {
+            log.err("xing4_0: num_attention_heads {d} != num_key_value_heads {d} (MLA expects the formal 32/32 form)\n", .{ config.num_attention_heads, config.num_key_value_heads });
+            return error.UnsupportedXing4Config;
+        }
+        // The extra layer at num_hidden_layers is an MTP head, not trunk.
+        // Base inference excludes it, matching the reference model.
     } else if (std.mem.eql(u8, model_type, "laguna")) {
         // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder; nvfp4 experts, 256K
         // ctx). Pure-attention MoE that rides the qwen3.5/hy_v3 MoE forward
@@ -3662,7 +3880,103 @@ pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
+    errdefer weights.deinit();
+    if (config.isXing4()) try prepareXingWeights(&weights, config);
+    return weights;
+}
+
+fn removeWeight(weights: *Weights, name: []const u8) void {
+    if (weights.map.fetchRemove(name)) |entry| {
+        weights.allocator.free(entry.key);
+        _ = mlx.mlx_array_free(entry.value);
+    }
+}
+
+fn renameWeight(weights: *Weights, from: []const u8, to: []const u8) !void {
+    const value = weights.get(from) orelse return;
+    if (weights.get(to) != null) return error.DuplicateWeight;
+    const key = try weights.allocator.dupe(u8, to);
+    errdefer weights.allocator.free(key);
+    try weights.map.put(key, value);
+    const old = weights.map.fetchRemove(from).?;
+    weights.allocator.free(old.key);
+}
+
+/// Bind the original BF16 layout without rewriting the checkpoint on disk.
+/// Each expert bank is evaluated and its source handles released before the
+/// next bank, so staging never retains a second full copy of the experts.
+fn prepareXingWeights(weights: *Weights, config: *const ModelConfig) !void {
+    const a = weights.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var extra: std.ArrayList([]const u8) = .empty;
+    defer extra.deinit(a);
+    var keys = weights.map.keyIterator();
+    while (keys.next()) |key| {
+        if (!std.mem.startsWith(u8, key.*, "model.layers.")) continue;
+        const rest = key.*["model.layers.".len..];
+        const end = std.mem.indexOfScalar(u8, rest, '.') orelse continue;
+        const layer = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
+        if (layer >= config.num_hidden_layers) try extra.append(a, key.*);
+    }
+    for (extra.items) |key| removeWeight(weights, key);
+    for (0..config.num_hidden_layers) |li| {
+        var from_buf: [256]u8 = undefined;
+        var to_buf: [256]u8 = undefined;
+        for ([_][]const u8{ "q_a_proj", "q_a_layernorm", "q_b_proj", "kv_a_proj_with_mqa", "kv_a_layernorm", "kv_b_proj", "o_proj" }) |proj| {
+            const from = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.self_attn.{s}.weight", .{ li, proj });
+            const to = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.attention.{s}.weight", .{ li, if (std.mem.eql(u8, proj, "o_proj")) "dense" else proj });
+            try renameWeight(weights, from, to);
+        }
+        if (li < config.first_k_dense_replace) continue;
+        const bias_from = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.gate.e_score_correction_bias", .{li});
+        const bias_to = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.mlp.gate.expert_bias", .{li});
+        try renameWeight(weights, bias_from, bias_to);
+        // The reference projects the router in f32, before its sigmoid/top-k.
+        const router = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.gate.weight", .{li});
+        if (weights.map.getPtr(router)) |value| {
+            if (mlx.mlx_array_dtype(value.*) == .bfloat16) {
+                var wide = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(wide);
+                try mlx.check(mlx.mlx_astype(&wide, value.*, .float32, s));
+                _ = mlx.mlx_array_free(value.*);
+                value.* = wide;
+            }
+        }
+        for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+            const target = try std.fmt.bufPrint(&to_buf, "model.layers.{d}.mlp.switch_mlp.{s}.weight", .{ li, proj });
+            if (weights.get(target) != null) continue;
+            const parts = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(parts);
+            var shape: ?[2]c_int = null;
+            for (0..config.num_experts) |ei| {
+                const name = try std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ li, ei, proj });
+                const tensor = weights.get(name) orelse {
+                    log.err("missing Xing expert weight: {s}\n", .{name});
+                    return error.MissingWeight;
+                };
+                if (mlx.mlx_array_dtype(tensor) != .bfloat16 or mlx.mlx_array_ndim(tensor) != 2)
+                    return error.UnsupportedXingExpertLayout;
+                const dims = mlx.getShape(tensor);
+                if (shape) |expected| {
+                    if (!std.mem.eql(c_int, &expected, dims)) return error.UnsupportedXingExpertLayout;
+                } else shape = .{ dims[0], dims[1] };
+                try mlx.check(mlx.mlx_vector_array_append_value(parts, tensor));
+            }
+            var bank = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(bank);
+            try mlx.check(mlx.mlx_stack_axis(&bank, parts, 0, s));
+            try mlx.check(mlx.mlx_array_eval(bank));
+            const key = try a.dupe(u8, target);
+            errdefer a.free(key);
+            try weights.map.put(key, bank);
+            for (0..config.num_experts) |ei| {
+                const name = std.fmt.bufPrint(&from_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ li, ei, proj }) catch unreachable;
+                removeWeight(weights, name);
+            }
+        }
+    }
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3922,6 +4236,55 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "xing4_0 raw BF16 weights load without an on-disk conversion" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..path_len];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{root}, 0);
+    defer a.free(path);
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    const shape = [_]c_int{ 2, 3 };
+    const bits = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+    const tensor = mlx.mlx_array_new_data(&bits, &shape, 2, .bfloat16);
+    defer _ = mlx.mlx_array_free(tensor);
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.0.self_attn.o_proj.weight", tensor));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.e_score_correction_bias", tensor));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.1.mlp.gate.weight", tensor));
+    try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.2.eh_proj.weight", tensor));
+    for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |proj| {
+        for (0..2) |expert| {
+            const name = try std.fmt.allocPrintSentinel(a, "model.layers.1.mlp.experts.{d}.{s}.weight", .{ expert, proj }, 0);
+            defer a.free(name);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(map, name, tensor));
+        }
+    }
+    try mlx.check(mlx.mlx_save_safetensors(path, map, meta));
+    const cfg = ModelConfig{ .model_type = "xing4_0", .xing_hc = true, .num_hidden_layers = 2, .num_experts = 2, .first_k_dense_replace = 1 };
+    var weights = try loadModelWeights(io, a, root, &cfg, false);
+    defer weights.deinit();
+    try testing.expect(weights.get("model.layers.0.attention.dense.weight") != null);
+    try testing.expect(weights.get("model.layers.0.self_attn.o_proj.weight") == null);
+    try testing.expect(weights.get("model.layers.1.mlp.gate.expert_bias") != null);
+    try testing.expect(weights.get("model.layers.2.eh_proj.weight") == null);
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(weights.get("model.layers.1.mlp.gate.weight").?));
+    const bank = weights.get("model.layers.1.mlp.switch_mlp.gate_proj.weight").?;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(bank));
+    try testing.expectEqual(@as(c_int, 3), mlx.mlx_array_ndim(bank));
+    try testing.expectEqualSlices(c_int, &.{ 2, 2, 3 }, mlx.getShape(bank));
+    try mlx.check(mlx.mlx_array_eval(bank));
+    const actual = mlx.mlx_array_data_bfloat16(bank).?;
+    try testing.expectEqualSlices(u16, &bits, actual[0..6]);
+    try testing.expectEqualSlices(u16, &bits, actual[6..12]);
+    try testing.expect(weights.get("model.layers.1.mlp.experts.0.gate_proj.weight") == null);
+}
 
 test "ModelConfig defaults" {
     const config = ModelConfig{};
@@ -6206,6 +6569,217 @@ test "parseConfigFromJson bailing_hybrid refuses by NAME every variant it cannot
     const ok = try parseConfigFromJson(testing.allocator, softplus);
     try testing.expect(ok.kda_vector_gate);
     try testing.expect(!ok.kdaUsesBoundedGate());
+}
+
+test "xing4_0 config parse (Xing4.0-29B-A4B release geometry)" {
+    // Representative = the shipped config.json, verbatim keys, trimmed of
+    // defaults. The mapping decisions to pin: head_dim follows HF's
+    // Xing4_0Config override (the ROTARY width, not hidden/heads), the
+    // attention scale is measured over the FULL 192-wide query dim, and the
+    // YaRN mscale lands in yarn_attention_factor for the forward to fold
+    // (SQUARED) into the softmax scale — NOT onto cos/sin.
+    const json =
+        \\{
+        \\  "model_type": "xing4_0",
+        \\  "hidden_size": 3584, "intermediate_size": 9216, "moe_intermediate_size": 1024,
+        \\  "num_hidden_layers": 40, "num_attention_heads": 32, "num_key_value_heads": 32,
+        \\  "n_routed_experts": 64, "num_experts_per_tok": 4, "n_shared_experts": 1,
+        \\  "first_k_dense_replace": 2, "moe_layer_freq": 1,
+        \\  "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+        \\  "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.0,
+        \\  "kv_lora_rank": 512, "q_lora_rank": 768,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "rope_theta": 10000, "rms_norm_eps": 1e-06,
+        \\  "max_position_embeddings": 262144,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32, "beta_slow": 1, "factor": 64,
+        \\    "mscale": 1.0, "mscale_all_dim": 1.0,
+        \\    "original_max_position_embeddings": 4096, "type": "yarn"
+        \\  },
+        \\  "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-06,
+        \\  "mhc_h_res_clamp_min": -30, "mhc_h_res_clamp_max": 30,
+        \\  "num_nextn_predict_layers": 1, "attention_bias": false,
+        \\  "vocab_size": 131072, "tie_word_embeddings": false,
+        \\  "bos_token_id": 1, "eos_token_id": 2
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("xing4_0", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(config.isXing4());
+    try testing.expect(config.isMla());
+    try testing.expect(config.isMoe());
+    try testing.expect(!config.isLinearLayer(7)); // NO hybrid layers — every layer is MLA
+    try testing.expect(!config.needsSsmEntries());
+    try testing.expect(!config.supportsBatchedGdnDecode()); // serial v1 decode
+    try testing.expect(!config.has_sliding_window);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.scale_embeddings);
+
+    // Cache/score width and rotary width have different contracts.
+    try testing.expectEqual(@as(u32, 768), config.mla_q_lora_rank);
+    try testing.expectEqual(@as(u32, 512), config.mla_kv_lora_rank);
+    try testing.expectEqual(@as(u32, 128), config.mla_qk_nope_head_dim);
+    try testing.expectEqual(@as(u32, 64), config.mla_qk_rope_head_dim);
+    try testing.expectEqual(@as(u32, 128), config.mla_v_head_dim);
+    try testing.expectEqual(@as(u32, 192), config.mlaQkHeadDim());
+    try testing.expectEqual(@as(u32, 192), config.query_pre_attn_scalar);
+    try testing.expectEqual(@as(u32, 192), config.head_dim);
+    try testing.expect(config.rope_interleaved_pairs);
+    try testing.expectEqual(@as(f32, 64), @as(f32, @floatFromInt(config.head_dim)) * config.partial_rotary_factor);
+    try testing.expectEqual(@as(u32, 64), config.yarnRotaryDim());
+
+    // MoE: sigmoid router + selection bias, dense bottom 2 layers, one
+    // ungated shared expert at the routed width, route_scale 2.0, ungrouped.
+    try testing.expect(config.moe_sigmoid_router);
+    try testing.expectEqual(@as(u32, 64), config.num_experts);
+    try testing.expectEqual(@as(u32, 4), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1024), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1024), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 2), config.first_k_dense_replace);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectEqual(@as(f32, 2.0), config.router_scaling_factor);
+    try testing.expectEqual(@as(u32, 1), config.moe_n_group);
+    try testing.expectEqual(@as(u32, 1), config.moe_topk_group);
+
+    // mHC: 4 streams, 20 denominator-eps Sinkhorn rounds, comb clamp ±30.
+    try testing.expect(config.xing_hc);
+    try testing.expectEqual(@as(u32, 4), config.xing_hc_mult);
+    try testing.expectEqual(@as(u32, 20), config.xing_hc_iters);
+    try testing.expectApproxEqAbs(@as(f32, 1e-6), config.xing_hc_eps, 1e-12);
+    try testing.expectEqual(@as(f32, -30), config.xing_hc_clamp_min);
+    try testing.expectEqual(@as(f32, 30), config.xing_hc_clamp_max);
+
+    // YaRN: factor 64 (4096 → 262144), ramp betas 32/1, and the mscale the
+    // forward squares into the attention scale: 0.1·ln(64)+1.
+    try testing.expect(config.rope_yarn);
+    try testing.expectEqual(@as(f32, 64), config.yarn_factor);
+    try testing.expectEqual(@as(u32, 4096), config.yarn_orig_max_pos);
+    try testing.expectEqual(@as(f32, 32), config.yarn_beta_fast);
+    try testing.expectEqual(@as(f32, 1), config.yarn_beta_slow);
+    try testing.expectEqual(@as(f32, 1.0), config.rope_scaling_factor);
+    const mscale: f32 = 0.1 * @log(@as(f32, 64)) + 1.0;
+    try testing.expectApproxEqAbs(mscale * mscale / @sqrt(@as(f32, 192)), config.attnScale(), 1e-6);
+    try testing.expectApproxEqAbs(mscale, config.yarn_attention_factor, 1e-6);
+
+    // The checkpoint's extra MTP layer is not part of base inference.
+    try testing.expectEqual(@as(u32, 0), config.dsv4_mtp_layers); // dsv4 fields stay untouched
+    try testing.expect(!config.isQwen4());
+}
+
+test "xing4_0 honest rejects: every variant the forward cannot serve refuses by NAME" {
+    // Same policy as bailing/dsv4: refuse loudly over serving silently wrong
+    // math. The template substitutes the WHOLE value for the keys variants
+    // exist for, so no duplicate JSON keys are involved.
+    const template =
+        \\{{
+        \\  "model_type": "xing4_0",
+        \\  "hidden_size": 3584, "intermediate_size": 9216, "moe_intermediate_size": 1024,
+        \\  "num_hidden_layers": 40, "num_attention_heads": 32, "num_key_value_heads": {0s},
+        \\  "n_routed_experts": 64, "num_experts_per_tok": 4, "n_shared_experts": {1s},
+        \\  "first_k_dense_replace": 2, "moe_layer_freq": {2s},
+        \\  "scoring_func": "{3s}", "topk_method": "{4s}",
+        \\  "n_group": {5s}, "topk_group": 1, "norm_topk_prob": true,
+        \\  "routed_scaling_factor": 2.0,
+        \\  "kv_lora_rank": {6s}, "q_lora_rank": {7s},
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "rope_interleave": {8s}, "attention_bias": {9s}, "rope_theta": 10000,
+        \\  "rope_scaling": {10s},
+        \\  "hc_mult": {11s}, "hc_sinkhorn_iters": {12s}, "hc_eps": 1e-06,
+        \\  "mhc_h_res_clamp_min": -30, "mhc_h_res_clamp_max": 30,
+        \\  "quantization": {{"bits": {13s}, "group_size": 64}},
+        \\  "vocab_size": 131072
+        \\}}
+    ;
+    const yarn_ok =
+        \\{"type": "yarn", "factor": 64, "mscale": 1.0, "mscale_all_dim": 1.0,
+        \\ "original_max_position_embeddings": 4096}
+    ;
+    const cases = [_]struct {
+        why: []const u8,
+        kv_heads: []const u8 = "32",
+        n_shared: []const u8 = "1",
+        moe_freq: []const u8 = "1",
+        scoring: []const u8 = "sigmoid",
+        topk: []const u8 = "noaux_tc",
+        n_group: []const u8 = "1",
+        kv_lora: []const u8 = "512",
+        q_lora: []const u8 = "768",
+        interleave: []const u8 = "true",
+        attn_bias: []const u8 = "false",
+        rope_scaling: []const u8 = yarn_ok,
+        hc_mult: []const u8 = "4",
+        iters: []const u8 = "20",
+        bits: []const u8 = "0",
+    }{
+        .{ .why = "only the original BF16 weight layout is supported", .bits = "4" },
+        .{ .why = "softmax-style router scores", .scoring = "gpt" },
+        .{ .why = "halves-form RoPE, not adjacent pairs", .interleave = "false" },
+        .{ .why = "mix buffers are fixed-width to 8", .hc_mult = "9" },
+        .{ .why = "no streams to mix", .hc_mult = "0" },
+        .{ .why = "comb never normalized", .iters = "0" },
+        .{ .why = "a different selection chain", .topk = "aux_loss" },
+        .{
+            .why = "cos/sin would scale as well as the attention scale",
+            .rope_scaling =
+            \\{"type": "yarn", "factor": 64, "mscale": 2.0, "mscale_all_dim": 1.0,
+            \\ "original_max_position_embeddings": 4096}
+            ,
+        },
+        .{
+            .why = "a yarn block with no window to scale from",
+            .rope_scaling =
+            \\{"type": "yarn", "factor": 64, "mscale_all_dim": 1.0}
+            ,
+        },
+        .{
+            .why = "explicit rope_scaling.attention_factor",
+            .rope_scaling =
+            \\{"type": "yarn", "factor": 64, "mscale_all_dim": 1.0, "attention_factor": 1.5,
+            \\ "original_max_position_embeddings": 4096}
+            ,
+        },
+        .{ .why = "additive q/kv/o biases are unbound", .attn_bias = "true" },
+        .{ .why = "interleaved dense/MoE pattern the binding lacks", .moe_freq = "2" },
+        .{ .why = "grouped selection the router never applies", .n_group = "8" },
+        .{ .why = "no KV latent to cache", .kv_lora = "0" },
+        .{ .why = "direct-q_proj weight layout", .q_lora = "0" },
+        .{ .why = "the forward binds exactly one shared expert", .n_shared = "2" },
+        .{ .why = "not the MLA formality 32/32", .kv_heads = "8" },
+    };
+    for (cases) |c| {
+        const json = try std.fmt.allocPrint(testing.allocator, template, .{
+            c.kv_heads, c.n_shared, c.moe_freq,   c.scoring,   c.topk,         c.n_group,
+            c.kv_lora,  c.q_lora,   c.interleave, c.attn_bias, c.rope_scaling, c.hc_mult,
+            c.iters,    c.bits,
+        });
+        defer testing.allocator.free(json);
+        try testing.expectError(
+            error.UnsupportedXing4Config,
+            parseConfigFromJson(testing.allocator, json),
+        );
+    }
+
+    // mscale_all_dim 0 means the reference applies NO mscale fold — served,
+    // with yarn_attention_factor staying 1.0.
+    const no_fold =
+        \\{
+        \\  "model_type": "xing4_0",
+        \\  "hidden_size": 3584, "moe_intermediate_size": 1024,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 32,
+        \\  "n_routed_experts": 64, "num_experts_per_tok": 4, "n_shared_experts": 1,
+        \\  "kv_lora_rank": 512, "q_lora_rank": 768,
+        \\  "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+        \\  "rope_interleave": true,
+        \\  "rope_scaling": {"type": "yarn", "factor": 64, "mscale_all_dim": 0,
+        \\                   "original_max_position_embeddings": 4096},
+        \\  "hc_mult": 4, "hc_sinkhorn_iters": 20
+        \\}
+    ;
+    const ok = try parseConfigFromJson(testing.allocator, no_fold);
+    try testing.expect(ok.rope_yarn);
+    try testing.expectEqual(@as(f32, 1.0), ok.yarn_attention_factor);
 }
 
 test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {

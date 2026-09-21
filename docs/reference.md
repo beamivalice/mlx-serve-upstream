@@ -82,10 +82,48 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
 | `laguna` | poolside Laguna S 2.1 | `model` | -- | 256/top-10 | Pure-attention MoE coder (nvfp4 experts); per-layer Q-heads, softplus attn gate, YaRN rope. See "Laguna" below. |
+| `xing4_0` | Xing4.0-29B-A4B | `model` | -- | 64/top-4 | Original BF16 checkpoint; full MLA + four-stream mHC; serial, no MTP. |
 | `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
+
+### Xing4.0 BF16
+
+`xing4_0` loads the original Hugging Face checkpoint directly. No Python runtime,
+quantization, or on-disk weight conversion is required. The 41 shards contain
+about 62.4 GB of tensors; allow additional memory for load staging, prefill and KV.
+Use an explicit small context for first bring-up, for example:
+
+```sh
+zig-out/bin/mlx-serve --model /path/to/Xing4.0-29B-A4B \
+  --serve --host 127.0.0.1 --ctx-size 4096
+```
+
+- `model.prepareXingWeights` binds the raw `self_attn.*` names to MLA, stacks
+  each expert bank in numeric order, then releases its source handles. The extra
+  `model.layers.40.*` MTP layer is excluded, as in the reference base model.
+- The trunk has 40 full-MLA layers (K=192, V=128), two initial dense FFNs, and
+  four mHC residual streams around attention and FFN. Router projection, selection
+  weights and weighted expert accumulation are f32; the residual stays BF16.
+  mHC normalizes in f32 and casts its gains/products back at the reference boundaries.
+- YaRN uses 64 rotary dimensions and a scale on the **entire** QK score.
+  `rope_interleave` defaults to true when absent. Stored head width and rotary
+  width are distinct; quantized-KV dequant staging is conservatively billed at
+  twice the larger K/V width.
+- `tokenizer.model` is loaded natively for SentencePiece BPE with the identity
+  normalizer. Special-token interception follows `tokenizer_config.json`, not
+  every control-piece spelling in the protobuf. In particular, the template's
+  unconfigured `<_observation>` follows ordinary SentencePiece tokenization.
+- Thinking uses `<think>` / `</think>`; tools use
+  `<tool_call>NAME<param_key>K</param_key><param_value>V</param_value></tool_call>`.
+  Tool history is rendered with object arguments, and string parameter whitespace
+  is retained. Native MTP and assistant sidecars are not enabled.
+- Tests: `zig build test -Doptimize=ReleaseFast -Dtest-filter=xing4`;
+  `tests/dump_xing4_fixtures.py` plus the `xing4 fixture` test compare original-layout
+  tiny BF16 weights with the CPU reference, including position-4096 cached decode;
+  `python3 tests/test_xing4.py /path/to/Xing4.0-29B-A4B` runs real HTTP checks.
+  Full 256K context and quantized weight packs are not validation claims.
 
 ### GGUF auto-routing
 

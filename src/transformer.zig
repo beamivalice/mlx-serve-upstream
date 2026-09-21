@@ -12817,6 +12817,26 @@ const HcWeights = struct {
     inject_flat: mlx.mlx_array = .{ .ctx = null },
 };
 
+/// Xing4.0 mHC hyper-connection (`Xing4_0HyperConnection` in the release's
+/// modeling code). An UNWEIGHTED RMS over the flattened `[hc*hidden]`
+/// streams feeds ONE full-rank linear (`hc_fn`, `[mix, hc*hidden]`,
+/// mix = (2+hc)·hc) whose output splits into the pre gains, the post gains
+/// and the `hc×hc` comb logits, offset by `hc_base` `[mix]` and scaled by
+/// `hc_scale` `[3]` (pre, post, comb). The comb logits clamp to ±30,
+/// exponentiate max-shifted and doubly-normalize for `xing_hc_iters`
+/// Sinkhorn rounds with the eps in the DENOMINATOR — deliberately NOT
+/// deepseek_v4's `hcSplitSinkhorn` formula (softmax-first, eps-in-prob,
+/// no clamp), whose parity tests pin ITS spelling.
+const XingHcWeights = struct {
+    fn_w: mlx.mlx_array,
+    fn_s: mlx.mlx_array,
+    fn_b: mlx.mlx_array,
+    base_w: mlx.mlx_array,
+    scale_w: mlx.mlx_array,
+    /// ones `[hc*hidden]` f32: the unweighted RMS reads through `rmsNorm`.
+    norm_ones: mlx.mlx_array,
+};
+
 /// qwen4_exp PLE: n-gram embedding → per-stream keys + one value, gated by
 /// the normalized streams, plus a dilated depthwise short conv.
 const PleWeights = struct {
@@ -13071,6 +13091,11 @@ const MoeLayerWeights = struct {
     hc_attn: ?HcWeights = null,
     hc_mlp: ?HcWeights = null,
     ple: ?PleWeights = null,
+    // xing4_0: the mHC hyper-connection weights around the attn and mlp
+    // sublayers. Null on every other arch — qwen4_exp's hc_attn/hc_mlp are
+    // the low-rank kind with a different formula and different names.
+    xing_attn_hc: ?XingHcWeights = null,
+    xing_ffn_hc: ?XingHcWeights = null,
 };
 
 // ── Hybrid layer weights (LFM2, Nemotron-H) ──
@@ -16473,6 +16498,15 @@ pub const Transformer = struct {
     /// Hy3 sigmoid+bias routing — compiled closure when available, else the
     /// direct chain. Returns owned `inds` + `norm_scores`.
     fn computeHy3Routing(self: *const Transformer, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !MoeRouting {
+        if (self.config.isXing4()) return sigmoidRoutingChain(
+            router_logits,
+            expert_bias,
+            @intCast(self.config.num_experts_per_tok),
+            self.config.moe_route_norm,
+            self.config.router_scaling_factor,
+            .float32,
+            self.s,
+        );
         // Group-limited ("noaux_tc") selection is the same sigmoid+bias chain
         // with a group mask between the bias and the top-k, so it shares this
         // entry point rather than a parallel one. `groupLimitedRouting` has its
@@ -18290,6 +18324,10 @@ pub const Transformer = struct {
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
         if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
+        // xing4_0: its own mHC trunk (moe_layers storage, different residual
+        // algebra) — must precede the generic MoE arm, which would serve the
+        // stream tensor as a plain hidden state.
+        if (self.config.isXing4()) return self.forwardXing4With(ctx, token_ids);
         if (self.hybrid_layers != null) return self.forwardHybridWith(ctx, token_ids);
         if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
         if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
@@ -18314,7 +18352,10 @@ pub const Transformer = struct {
     pub fn supportsLayerCapture(self: *const Transformer) bool {
         return self.dsv4 == null and
             self.bert_layers == null and
-            !self.config.use_bidirectional_attention;
+            !self.config.use_bidirectional_attention and
+            // xing4_0's forward does not fill `capture_layers`/`capture_hidden`
+            // yet; advertising capture would hand a drafter empty slots.
+            !self.config.isXing4();
     }
 
     /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -20243,7 +20284,14 @@ pub const Transformer = struct {
 
         // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
         // key histories reached per slot through `batch_slots` (kv differs).
-        const logits = (if (self.qwen4 != null) self.forwardQwen4With(&bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
+        // xing4_0 refuses: `modelBatchable` is false for every MoE config, so
+        // reaching this line at all means a gate was bypassed — say so rather
+        // than run a serial-only trunk against merged slot state.
+        const logits = blk: {
+            if (self.qwen4 != null) break :blk self.forwardQwen4With(&bctx, token_arr);
+            if (self.config.isXing4()) return error.Xing4NotBatchable;
+            break :blk self.forwardMoeWith(&bctx, token_arr);
+        } catch |e| {
             self.discardDeferredPle(&bctx);
             return e;
         };
@@ -23510,6 +23558,216 @@ pub const Transformer = struct {
         return logits;
     }
 
+    // Xing4.0: mHC around attention and FFN, then mean over streams at readout.
+
+    /// One sublayer's mHC read: the collapsed (pre-weighted) sublayer input
+    /// plus the `post` gains and Sinkhorn `comb` matrix the write needs.
+    const XingHcRead = struct {
+        mixed: mlx.mlx_array,
+        post: mlx.mlx_array,
+        comb: mlx.mlx_array,
+
+        fn deinit(self: *const XingHcRead) void {
+            _ = mlx.mlx_array_free(self.mixed);
+            _ = mlx.mlx_array_free(self.post);
+            _ = mlx.mlx_array_free(self.comb);
+        }
+    };
+
+    /// Xing4_0HyperConnection.forward, streams `[B,L,hc,H]`.
+    fn xingHcRead(self: *Transformer, streams: mlx.mlx_array, hw: *const XingHcWeights, batch: c_int, seq_len: c_int) !XingHcRead {
+        const cfg = &self.config;
+        const hc: c_int = @intCast(cfg.xing_hc_mult);
+        const hidden: c_int = @intCast(cfg.hidden_size);
+        const mix: c_int = (2 + hc) * hc;
+
+        // flat [B,L,hc*H] → unweighted RMS in f32 → back to the stream dtype
+        // (the reference normalizes in fp32, then runs the linear in bf16).
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, streams, &[_]c_int{ batch, seq_len, hc * hidden }, 3, self.s));
+        var flat32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat32);
+        try mlx.check(mlx.mlx_astype(&flat32, flat, .float32, self.s));
+        const normed32 = try self.rmsNorm(flat32, hw.norm_ones);
+        defer _ = mlx.mlx_array_free(normed32);
+        var normed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(normed);
+        try mlx.check(mlx.mlx_astype(&normed, normed32, mlx.mlx_array_dtype(streams), self.s));
+
+        const mixes = try self.qmatmul(normed, hw.fn_w, hw.fn_s, hw.fn_b);
+        defer _ = mlx.mlx_array_free(mixes);
+        var mixes32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mixes32);
+        try mlx.check(mlx.mlx_astype(&mixes32, mixes, .float32, self.s));
+
+        // Split (pre_w, post_w, comb_w) off the mix, add hc_base, scale by
+        // hc_scale. All slices are views; the arithmetic materializes.
+        const pre_w = try xingSliceLast(mixes32, 0, hc, self.s);
+        defer _ = mlx.mlx_array_free(pre_w);
+        const post_w = try xingSliceLast(mixes32, hc, 2 * hc, self.s);
+        defer _ = mlx.mlx_array_free(post_w);
+        const comb_w = try xingSliceLast(mixes32, 2 * hc, mix, self.s);
+        defer _ = mlx.mlx_array_free(comb_w);
+        var comb_w4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(comb_w4);
+        try mlx.check(mlx.mlx_reshape(&comb_w4, comb_w, &[_]c_int{ batch, seq_len, hc, hc }, 4, self.s));
+
+        const pre_b = try xingSliceLast(hw.base_w, 0, hc, self.s);
+        defer _ = mlx.mlx_array_free(pre_b);
+        const post_b = try xingSliceLast(hw.base_w, hc, 2 * hc, self.s);
+        defer _ = mlx.mlx_array_free(post_b);
+        const comb_b1 = try xingSliceLast(hw.base_w, 2 * hc, mix, self.s);
+        defer _ = mlx.mlx_array_free(comb_b1);
+        var comb_b = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(comb_b);
+        try mlx.check(mlx.mlx_reshape(&comb_b, comb_b1, &[_]c_int{ hc, hc }, 2, self.s));
+
+        const s0 = try xingSliceLast(hw.scale_w, 0, 1, self.s);
+        defer _ = mlx.mlx_array_free(s0);
+        const s1 = try xingSliceLast(hw.scale_w, 1, 2, self.s);
+        defer _ = mlx.mlx_array_free(s1);
+        const s2 = try xingSliceLast(hw.scale_w, 2, 3, self.s);
+        defer _ = mlx.mlx_array_free(s2);
+
+        // pre = sigmoid(pre_w*s0 + pre_b); post = 2*sigmoid(post_w*s1 + post_b)
+        const pre = try xingSigmoidGain(pre_w, s0, pre_b, 1.0, self.s);
+        defer _ = mlx.mlx_array_free(pre);
+        const post32 = try xingSigmoidGain(post_w, s1, post_b, 2.0, self.s);
+        defer _ = mlx.mlx_array_free(post32);
+        const dtype = mlx.mlx_array_dtype(streams);
+        var post = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(post);
+        try mlx.check(mlx.mlx_astype(&post, post32, dtype, self.s));
+
+        // comb: clamp → exp(x - rowmax) → iters × (row-norm, col-norm), eps
+        // in the denominator.
+        const comb32 = try xingCombSinkhorn(comb_w4, s2, comb_b, cfg.xing_hc_clamp_min, cfg.xing_hc_clamp_max, cfg.xing_hc_iters, cfg.xing_hc_eps, self.s);
+        defer _ = mlx.mlx_array_free(comb32);
+        var comb = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(comb);
+        try mlx.check(mlx.mlx_astype(&comb, comb32, dtype, self.s));
+
+        // The reference rounds the gain and each product before summing.
+        var pre_cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pre_cast);
+        try mlx.check(mlx.mlx_astype(&pre_cast, pre, dtype, self.s));
+        var pre4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pre4);
+        try mlx.check(mlx.mlx_reshape(&pre4, pre_cast, &[_]c_int{ batch, seq_len, hc, 1 }, 4, self.s));
+        var mixed4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mixed4);
+        try mlx.check(mlx.mlx_multiply(&mixed4, pre4, streams, self.s));
+        var mixed = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mixed);
+        try mlx.check(mlx.mlx_sum_axis(&mixed, mixed4, 2, false, self.s));
+        return .{ .mixed = mixed, .post = post, .comb = comb };
+    }
+
+    /// The write half: `streams = post ⊙ out + comb @ streams`, in place.
+    fn xingHcWrite(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, post: mlx.mlx_array, comb: mlx.mlx_array, batch: c_int, seq_len: c_int) !void {
+        const hc: c_int = @intCast(self.config.xing_hc_mult);
+        const hidden: c_int = @intCast(self.config.hidden_size);
+        var post4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(post4);
+        try mlx.check(mlx.mlx_reshape(&post4, post, &[_]c_int{ batch, seq_len, hc, 1 }, 4, self.s));
+        var out4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out4);
+        try mlx.check(mlx.mlx_reshape(&out4, out, &[_]c_int{ batch, seq_len, 1, hidden }, 4, self.s));
+        var gated = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated);
+        try mlx.check(mlx.mlx_multiply(&gated, post4, out4, self.s));
+        var mixed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mixed);
+        try mlx.check(mlx.mlx_matmul(&mixed, comb, h.*, self.s));
+        var nh = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&nh, gated, mixed, self.s));
+        _ = mlx.mlx_array_free(h.*);
+        h.* = nh;
+    }
+
+    fn forwardXing4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const ml = self.moe_layers.?;
+        const cfg = &self.config;
+        const hc: c_int = @intCast(cfg.xing_hc_mult);
+        const offset = ctx.moe_seq_offset.*;
+
+        const emb = try self.embedding(token_ids);
+        defer _ = mlx.mlx_array_free(emb);
+        const x_shape = mlx.getShape(emb);
+        const batch: c_int = x_shape[0];
+        const seq_len: c_int = x_shape[1];
+        const hidden: c_int = x_shape[2];
+        const is_prefill = seq_len > 1;
+
+        const eval_cadence = prefillEvalCadence(
+            PREFILL_EVAL_CADENCE_DEFAULT,
+            cfg.prefillScoreHeadDim(),
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            @intCast(seq_len),
+            @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
+            ctx.cache.config.scheme != .off,
+        );
+        // embed [B,L,H] → streams [B,L,hc,H] (a broadcast, materialized once
+        // by the first read's reshape).
+        var e4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(e4);
+        try mlx.check(mlx.mlx_reshape(&e4, emb, &[_]c_int{ batch, seq_len, 1, hidden }, 4, self.s));
+        var h = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(h);
+        try mlx.check(mlx.mlx_broadcast_to(&h, e4, &[_]c_int{ batch, seq_len, hc, hidden }, 4, self.s));
+
+        // One-shot dtype trace (see the class guard at the bottom of this
+        // file): the first projection an MLA layer reads is the low-rank Q.
+        var dt = mlx.DtypeTrace.begin("xing4", h, ml[0].attn.full.mla_q_a_w);
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
+            const li: u32 = @intCast(layer_idx);
+            const lw = &ml[layer_idx];
+
+            // ── attention sublayer ──
+            const r = try self.xingHcRead(h, &lw.xing_attn_hc.?, batch, seq_len);
+            defer r.deinit();
+            const x = try self.rmsNorm(r.mixed, lw.input_norm);
+            defer _ = mlx.mlx_array_free(x);
+            const attn_out = try self.mlaAttnWith(ctx, x, &lw.attn.full, li, @intCast(offset), batch, seq_len, is_prefill);
+            defer _ = mlx.mlx_array_free(attn_out);
+            try self.xingHcWrite(&h, attn_out, r.post, r.comb, batch, seq_len);
+
+            // ── feed-forward sublayer ──
+            const r2 = try self.xingHcRead(h, &lw.xing_ffn_hc.?, batch, seq_len);
+            defer r2.deinit();
+            const x2 = try self.rmsNorm(r2.mixed, lw.post_attn_norm);
+            defer _ = mlx.mlx_array_free(x2);
+            const mlp_out = switch (lw.mlp) {
+                .moe => |*mw| try self.moeMLP(x2, mw),
+                .dense => |*dw| try self.denseMLP(x2, dw),
+            };
+            defer _ = mlx.mlx_array_free(mlp_out);
+            try self.xingHcWrite(&h, mlp_out, r2.post, r2.comb, batch, seq_len);
+            dt.layer(h, layer_idx);
+            if (prefillEvalCadenceApplies(seq_len) and
+                ((layer_idx + 1) % eval_cadence == 0 or layer_idx + 1 == cfg.num_hidden_layers))
+            {
+                try evalCadencePoint(h, ctx.ssm_entries);
+                _ = mlx.mlx_clear_cache();
+            }
+        }
+
+        ctx.moe_seq_offset.* += @intCast(seq_len);
+
+        // Readout: mean over the streams → model.norm → lm_head.
+        var meaned = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(meaned);
+        try mlx.check(mlx.mlx_mean_axis(&meaned, h, 2, false, self.s));
+        const normed = try self.rmsNorm(meaned, self.final_norm);
+        dt.end(normed);
+        if (self.embedding_mode or ctx.skip_lm_head) return normed;
+        defer _ = mlx.mlx_array_free(normed);
+        return self.lmHeadProject(normed, ctx.argmax_only);
+    }
+
     fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         self.fwd_gen +%= 1; // per-forward QSA scratch key
         const ml = self.moe_layers.?;
@@ -25788,7 +26046,7 @@ pub const Transformer = struct {
         const qk_dim: c_int = nope + rope_d;
         const v_dim: c_int = @intCast(cfg.mla_v_head_dim);
         const kv_lora: c_int = @intCast(cfg.mla_kv_lora_rank);
-        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+        const attn_scale = cfg.attnScale();
         const perm = [_]c_int{ 0, 2, 1, 3 };
         const strides3 = [_]c_int{ 1, 1, 1 };
         const strides4 = [_]c_int{ 1, 1, 1, 1 };
@@ -25860,14 +26118,17 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_transpose_axes(&k_pe_t, k_pe_h, &perm, 4, self.s));
         }
 
-        // RoPE over the whole rope slice, adjacent-pair rotation.
+        // Xing's YaRN scale applies to the WHOLE QK dot product (including
+        // NoPE), through attnScale, not just to the rotated slice.
         const traditional = cfg.rope_interleaved_pairs;
+        const yarn_freqs: mlx.mlx_array = if (cfg.rope_yarn) (self.rope_freqs_yarn orelse .{ .ctx = null }) else .{ .ctx = null };
+        const rope_base = mlx.mlx_optional_float{ .value = cfg.rope_theta, .has_value = yarn_freqs.ctx == null };
         var q_rot = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rot);
         var k_rot = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rot);
-        try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, rope_base, 1.0, offset, yarn_freqs, self.s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, rope_base, 1.0, offset, yarn_freqs, self.s));
 
         // The rope key is MQA — one head, replicated so the cached K is a
         // plain [B,H,S,qk_dim] tensor the standard cache path can carry.
@@ -29266,7 +29527,7 @@ pub const Transformer = struct {
         // MoE layer, which then promotes every weight on read for the rest of
         // the forward — a whole-model slowdown that shows up only as a
         // `[dtype-trace] residual widened` line.
-        if (mlx.mlx_array_dtype(norm_scores) != mlx.mlx_array_dtype(expert_x)) {
+        if (!cfg.isXing4() and mlx.mlx_array_dtype(norm_scores) != mlx.mlx_array_dtype(expert_x)) {
             var cast_scores = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&cast_scores, norm_scores, mlx.mlx_array_dtype(expert_x), self.s));
             _ = mlx.mlx_array_free(norm_scores);
@@ -29602,6 +29863,14 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
         }
 
+        // Xing accumulates weighted experts in f32, then adds the shared
+        // expert in the residual dtype.
+        if (cfg.isXing4()) {
+            var cast_sum = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&cast_sum, expert_sum, mlx.mlx_array_dtype(expert_x), self.s));
+            _ = mlx.mlx_array_free(expert_sum);
+            expert_sum = cast_sum;
+        }
         if (skip_shared) return expert_sum;
 
         // Hy3: shared expert ALWAYS added, no gate (reference MoE.__call__:
@@ -30117,6 +30386,56 @@ fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k: mlx
     }
 }
 
+/// xing4_0 mHC weights for one sublayer (`{base}.hc_fn|hc_base|hc_scale`).
+/// `hc_fn` is dense bf16 `[mix, hc*hidden]` (transposed at load like every
+/// other bf16 projection); `hc_base` `[mix]` and `hc_scale` `[3]` are f32
+/// constants the Sinkhorn chain adds and multiplies by.
+fn loadXingHcWeights(weights: *const Weights, base: []const u8, config: ModelConfig, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !XingHcWeights {
+    var nb: [192]u8 = undefined;
+    var fn_w = weights.get(std.fmt.bufPrint(&nb, "{s}.hc_fn", .{base}) catch unreachable) orelse {
+        log.err("MISSING WEIGHT: {s}.hc_fn\n", .{base});
+        return error.MissingWeight;
+    };
+    try maybeTransposeForBf16(&fn_w, .{ .ctx = null }, owned_bf16, allocator, s);
+    const base_raw = weights.get(std.fmt.bufPrint(&nb, "{s}.hc_base", .{base}) catch unreachable) orelse {
+        log.err("MISSING WEIGHT: {s}.hc_base\n", .{base});
+        return error.MissingWeight;
+    };
+    const scale_raw = weights.get(std.fmt.bufPrint(&nb, "{s}.hc_scale", .{base}) catch unreachable) orelse {
+        log.err("MISSING WEIGHT: {s}.hc_scale\n", .{base});
+        return error.MissingWeight;
+    };
+    // The chain runs in f32; land the two constants there once at load.
+    const base_w = try castF32(base_raw, owned_bf16, allocator, s);
+    const scale_w = try castF32(scale_raw, owned_bf16, allocator, s);
+    // ones [hc*hidden]: the unweighted input RMS reads through rmsNorm.
+    const flat: usize = @as(usize, config.xing_hc_mult) * config.hidden_size;
+    var ones = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(ones);
+    const oshape = [_]c_int{@intCast(flat)};
+    try mlx.check(mlx.mlx_ones(&ones, &oshape, 1, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(ones));
+    try owned_bf16.append(allocator, ones);
+    return .{
+        .fn_w = fn_w,
+        .fn_s = .{ .ctx = null },
+        .fn_b = .{ .ctx = null },
+        .base_w = base_w,
+        .scale_w = scale_w,
+        .norm_ones = ones,
+    };
+}
+
+fn castF32(arr: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (mlx.mlx_array_dtype(arr) == .float32) return arr;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    try owned.append(allocator, out);
+    return out;
+}
+
 fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !PleWeights {
     var nb: [160]u8 = undefined;
     const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, owned_bf16, allocator, s);
@@ -30152,6 +30471,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     const is_laguna = std.mem.eql(u8, config.model_type, "laguna");
     const is_inkling = std.mem.eql(u8, config.model_type, "inkling_mm_model");
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
+    const is_xing4 = config.isXing4();
     const is_qwen4 = config.isQwen4();
     const is_gpt_oss = std.mem.eql(u8, config.model_type, "gpt_oss");
 
@@ -30194,6 +30514,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         lw.hc_attn = null;
         lw.hc_mlp = null;
         lw.ple = null;
+        lw.xing_attn_hc = null;
+        lw.xing_ffn_hc = null;
         if (is_qwen4) {
             var hb: [96]u8 = undefined;
             lw.hc_attn = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
@@ -30201,6 +30523,12 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             if (config.ple_layer_idx == @as(i32, @intCast(li))) {
                 lw.ple = try loadPleWeights(weights, name_buf, prefix, li, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
             }
+        }
+
+        if (is_xing4) {
+            var hb: [160]u8 = undefined;
+            lw.xing_attn_hc = try loadXingHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hc", .{ prefix, li }) catch unreachable, config, &owned_bf16, allocator, s);
+            lw.xing_ffn_hc = try loadXingHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.ffn_hc", .{ prefix, li }) catch unreachable, config, &owned_bf16, allocator, s);
         }
 
         if (is_inkling) {
@@ -30432,11 +30760,14 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
             }
-        } else if (is_bailing) {
+        } else if (is_bailing or is_xing4) {
             // MLA. There are no q/k/v projections at all — the low-rank Q and
             // the compressed KV latent replace them, and `dense` is the output
             // projection. q_w/k_w/v_w stay null-ctx (skipped by the eval batch
             // and by every fused-QKV probe, which all key on q_w).
+            //
+            // prepareXingWeights maps the raw MLA names here; Xing has no
+            // per-head output gate.
             lw.attn = .{
                 .full = .{
                     .q_w = mlx.mlx_array_new(),
@@ -30454,9 +30785,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     // MLA norms the LATENTS, not the per-head q/k.
                     .q_norm = mlx.mlx_array_new(),
                     .k_norm = mlx.mlx_array_new(),
-                    .g_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
-                    .g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
-                    .g_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
+                    .g_w = if (is_xing4) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
+                    .g_s = if (is_xing4) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new()),
+                    .g_b = if (is_xing4) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new()),
                     // Exactly ONE Q arm per checkpoint: the low-rank pair
                     // (tiny) or a direct q_proj (flash, `q_lora_rank: null`).
                     // Asking for the absent one would abort the load.
@@ -30640,13 +30971,15 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             (getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight") != null)
         else
             (config.isMoe() and li >= config.first_k_dense_replace);
-        if (layer_is_moe and is_bailing) {
+        if (layer_is_moe and (is_bailing or is_xing4)) {
             // bailing_hybrid MoE: mlx-lm's stacked `mlp.experts.*` banks, an
             // `mlp.gate.weight` router with an f32 `mlp.gate.expert_bias`
             // SELECTION bias, and one UNGATED always-added shared expert.
             // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
             // routed_scaling_factor) is hy3's chain with the group limit
             // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
+            //
+            // Xing's raw banks are stacked at load and use the same names.
             //
             // mlx-lm's converter renames both banks: it quantizes the router
             // and keeps its module level, so the router lands at
@@ -32264,6 +32597,10 @@ pub fn groupLimitedRouting(
 }
 
 fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, route_norm: bool, route_scale: f32, s: mlx.mlx_stream) !Transformer.MoeRouting {
+    return sigmoidRoutingChain(router_logits, expert_bias, k, route_norm and k > 1, route_scale, .bfloat16, s);
+}
+
+fn sigmoidRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, route_norm: bool, route_scale: f32, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !Transformer.MoeRouting {
     var logits_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logits_f32);
     try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, s));
@@ -32304,7 +32641,7 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 
     var weights_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(weights_f32);
-    if (route_norm and k > 1) {
+    if (route_norm) {
         var sum_raw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sum_raw);
         try mlx.check(mlx.mlx_sum_axis(&sum_raw, top, -1, true, s));
@@ -32330,9 +32667,120 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 
     var norm_scores = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(norm_scores);
-    try mlx.check(mlx.mlx_astype(&norm_scores, scaled, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&norm_scores, scaled, dtype, s));
 
     return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
+// ── Xing4.0 mHC hyper-connection math ───────────────────────────────────
+//
+// `Xing4_0HyperConnection.forward`, op for op. These are deliberately NOT
+// deepseek_v4's hcSplitSinkhorn (softmax-first, eps-in-probability, no
+// clamp): xing clamps the comb logits to ±30, exponentiates max-shifted, and
+// puts the eps in the DENOMINATOR of every row/col normalization.
+
+/// `a[..., from:to]` on the last axis — a VIEW; the caller owns `a`.
+fn xingSliceLast(a: mlx.mlx_array, from: c_int, to: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const nd: usize = @intCast(mlx.mlx_array_ndim(a));
+    std.debug.assert(nd >= 1 and nd <= 4);
+    const shape = mlx.getShape(a);
+    var start: [4]c_int = .{ 0, 0, 0, 0 };
+    var stop: [4]c_int = undefined;
+    for (0..nd) |i| stop[i] = shape[i];
+    start[nd - 1] = from;
+    stop[nd - 1] = to;
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, a, &start, nd, &stop, nd, &strides, nd, s));
+    return out;
+}
+
+/// `mul * sigmoid(w * scale + base)` — the pre/post gains.
+fn xingSigmoidGain(w: mlx.mlx_array, scale: mlx.mlx_array, base: mlx.mlx_array, mul: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    var t = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_multiply(&t, w, scale, s));
+    var t2 = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(t2);
+    try mlx.check(mlx.mlx_add(&t2, t, base, s));
+    _ = mlx.mlx_array_free(t);
+    t = .{ .ctx = null };
+    var sig = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, t2, s));
+    _ = mlx.mlx_array_free(t2);
+    t2 = .{ .ctx = null };
+    if (mul == 1.0) return sig;
+    const mul_arr = mlx.mlx_array_new_float(mul);
+    defer _ = mlx.mlx_array_free(mul_arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&out, sig, mul_arr, s));
+    _ = mlx.mlx_array_free(sig);
+    return out;
+}
+
+/// clamp(comb_w * scale + base) → exp(x - rowmax) → `iters` × (row-norm,
+/// col-norm), each sum getting the eps in its denominator.
+fn xingCombSinkhorn(
+    comb_w: mlx.mlx_array,
+    scale: mlx.mlx_array,
+    base: mlx.mlx_array,
+    clamp_min: f32,
+    clamp_max: f32,
+    iters: u32,
+    eps: f32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    var scaled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, comb_w, scale, s));
+    var logits = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_add(&logits, scaled, base, s));
+    _ = mlx.mlx_array_free(scaled);
+    scaled = .{ .ctx = null };
+    const lo = mlx.mlx_array_new_float(clamp_min);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(clamp_max);
+    defer _ = mlx.mlx_array_free(hi);
+    var clamped = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(clamped);
+    try mlx.check(mlx.mlx_clip(&clamped, logits, lo, hi, s));
+    _ = mlx.mlx_array_free(logits);
+    logits = .{ .ctx = null };
+    var rowmax = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rowmax);
+    try mlx.check(mlx.mlx_max_axis(&rowmax, clamped, -1, true, s));
+    var shifted = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(shifted);
+    try mlx.check(mlx.mlx_subtract(&shifted, clamped, rowmax, s));
+    _ = mlx.mlx_array_free(clamped);
+    clamped = .{ .ctx = null };
+    var comb = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(comb);
+    try mlx.check(mlx.mlx_exp(&comb, shifted, s));
+    _ = mlx.mlx_array_free(shifted);
+    shifted = .{ .ctx = null };
+
+    const eps_arr = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    var i: u32 = 0;
+    while (i < iters) : (i += 1) {
+        for ([_]c_int{ -1, -2 }) |axis| {
+            var sum = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_sum_axis(&sum, comb, axis, true, s));
+            var denominator = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(denominator);
+            try mlx.check(mlx.mlx_add(&denominator, sum, eps_arr, s));
+            var next = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(next);
+            try mlx.check(mlx.mlx_divide(&next, comb, denominator, s));
+            _ = mlx.mlx_array_free(comb);
+            comb = next;
+        }
+    }
+    return comb;
 }
 
 // ── Fused MoE router (top-K selection + weight normalization in ONE kernel) ──
@@ -42016,6 +42464,15 @@ test "qmatmulBits dispatches to plain matmul when scales has null ctx (Unsloth D
 }
 
 /// Test helper: eval `arr`, flatten, and copy the first `out.len` f32 values to host.
+/// `testReadF32` for possibly-strided arrays: `mlx_array_data_*` reads a
+/// view's raw buffer, so materialize first.
+fn testReadF32Contig(arr: mlx.mlx_array, out: []f32, s: mlx.mlx_stream) !void {
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, arr, false, s));
+    try testReadF32(c, out, s);
+}
+
 fn testReadF32(arr: mlx.mlx_array, out: []f32, s: mlx.mlx_stream) !void {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
@@ -42538,6 +42995,226 @@ test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
             try testReadF32(ref, ref_host, s);
             try testReadF32(got, got_host, s);
             try testing.expectEqualSlices(f32, ref_host, got_host);
+        }
+    }
+}
+
+test "xing4_0 router keeps selection weights in f32" {
+    const s = mlx.gpuStream();
+    var tf: Transformer = undefined;
+    tf.config = .{ .model_type = "xing4_0", .xing_hc = true, .num_experts_per_tok = 2, .router_scaling_factor = 2 };
+    tf.s = s;
+    tf.compiled_hy3_routing = null;
+    const vals = [_]f32{ 1, 0, 2 };
+    const logits = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 1, 3 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var bias = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bias);
+    try mlx.check(mlx.mlx_zeros(&bias, &[_]c_int{3}, 1, .float32, s));
+    const routed = try tf.computeHy3Routing(logits, bias);
+    defer _ = mlx.mlx_array_free(routed.inds);
+    defer _ = mlx.mlx_array_free(routed.norm_scores);
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(routed.norm_scores));
+    var actual: [2]f32 = undefined;
+    try testReadF32(routed.norm_scores, &actual, s);
+    const a: f32 = 1.0 / (1.0 + @exp(@as(f32, -1)));
+    const b: f32 = 1.0 / (1.0 + @exp(@as(f32, -2)));
+    const low = @min(actual[0], actual[1]);
+    const high = @max(actual[0], actual[1]);
+    try testing.expectApproxEqAbs(2 * a / (a + b), low, 1e-6);
+    try testing.expectApproxEqAbs(2 * b / (a + b), high, 1e-6);
+}
+
+test "xing4_0 mHC read and write preserve the BF16 stream" {
+    const s = mlx.gpuStream();
+    var tf: Transformer = undefined;
+    tf.config = .{ .hidden_size = 8, .xing_hc_mult = 4, .xing_hc_iters = 20 };
+    tf.s = s;
+    tf.rht = null;
+    var stream = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stream);
+    try mlx.check(mlx.mlx_ones(&stream, &[_]c_int{ 1, 2, 4, 8 }, 4, .bfloat16, s));
+    var fn_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fn_w);
+    try mlx.check(mlx.mlx_zeros(&fn_w, &[_]c_int{ 24, 32 }, 2, .bfloat16, s));
+    var base = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(base);
+    try mlx.check(mlx.mlx_zeros(&base, &[_]c_int{24}, 1, .float32, s));
+    var scale = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scale);
+    try mlx.check(mlx.mlx_ones(&scale, &[_]c_int{3}, 1, .float32, s));
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const names = [_][]const u8{ "hc_fn", "hc_base", "hc_scale" };
+    for ([_]mlx.mlx_array{ fn_w, base, scale }, names) |value, name| {
+        const key = try std.fmt.allocPrint(testing.allocator, "model.layers.0.attn_hc.{s}", .{name});
+        var copy = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&copy, value));
+        try weights.map.put(key, copy);
+    }
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |value| _ = mlx.mlx_array_free(value);
+        owned.deinit(testing.allocator);
+    }
+    const hw = try loadXingHcWeights(&weights, "model.layers.0.attn_hc", tf.config, &owned, testing.allocator, s);
+    const r = try tf.xingHcRead(stream, &hw, 1, 2);
+    defer r.deinit();
+    for ([_]mlx.mlx_array{ r.mixed, r.post, r.comb }) |value|
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(value));
+    var mixed: [16]f32 = undefined;
+    try testReadF32(r.mixed, &mixed, s);
+    for (mixed) |value| try testing.expectEqual(@as(f32, 2), value);
+    try tf.xingHcWrite(&stream, r.mixed, r.post, r.comb, 1, 2);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(stream));
+    var written: [64]f32 = undefined;
+    try testReadF32(stream, &written, s);
+    for (written) |value| try testing.expectEqual(@as(f32, 3), value);
+}
+
+test "xing4_0 mHC gains and comb match the reference formula element-for-element" {
+    // Reference = `Xing4_0HyperConnection.forward` from the release's
+    // modeling code, spelled as a plain f32 host loop: pre = sigma(w*s0+b),
+    // post = 2*sigma(w*s1+b), comb = clamp(w*s2+b, +/-30) -> exp(x-rowmax) ->
+    // 20 x (row-norm, col-norm) with the eps in the DENOMINATOR. The op chain
+    // (xingSigmoidGain/xingCombSinkhorn) runs the same math on device; the two
+    // must agree per element. This is the guard against the deepseek_v4
+    // spelling (softmax-first, eps-in-probability, no clamp) creeping in.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1A5E7);
+    const rnd = prng.random();
+
+    const HC: usize = 4;
+    const MIX: usize = (2 + HC) * HC; // 24 = pre(4) + post(4) + comb(16)
+    const ROWS: usize = 3; // a few tokens; the math is per-row
+    const ITERS: u32 = 20;
+    const EPS: f32 = 1e-6;
+    const CLAMP_MIN: f32 = -30;
+    const CLAMP_MAX: f32 = 30;
+
+    // The mix linear's output, laid out exactly as the forward's
+    // [B, L, mix] tensor: row-major over (row, mix).
+    const w_buf = try allocator.alloc(f32, ROWS * MIX);
+    defer allocator.free(w_buf);
+    for (w_buf) |*v| v.* = (rnd.float(f32) - 0.5) * 8.0; // wide enough to exercise the clamp
+    const w_shape = [_]c_int{ @intCast(ROWS), 1, @intCast(MIX) };
+    const mixes = mlx.mlx_array_new_data(w_buf.ptr, &w_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(mixes);
+
+    const scale_buf = [_]f32{ 0.7, 1.3, -0.9 };
+    const scale_shape = [_]c_int{3};
+    const scale = mlx.mlx_array_new_data(&scale_buf, &scale_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const base_buf = try allocator.alloc(f32, MIX);
+    defer allocator.free(base_buf);
+    for (base_buf) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const base_shape = [_]c_int{@intCast(MIX)};
+    const base = mlx.mlx_array_new_data(base_buf.ptr, &base_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+
+    // The forward's splits: pre/post off `mixes`, comb reshaped to [hc, hc],
+    // base split the same way, scale per segment.
+    const pre_w = try xingSliceLast(mixes, 0, @intCast(HC), s);
+    defer _ = mlx.mlx_array_free(pre_w);
+    const post_w = try xingSliceLast(mixes, @intCast(HC), @intCast(2 * HC), s);
+    defer _ = mlx.mlx_array_free(post_w);
+    const comb_w = try xingSliceLast(mixes, @intCast(2 * HC), @intCast(MIX), s);
+    defer _ = mlx.mlx_array_free(comb_w);
+    var comb_w4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(comb_w4);
+    try mlx.check(mlx.mlx_reshape(&comb_w4, comb_w, &[_]c_int{ @intCast(ROWS), 1, HC, HC }, 4, s));
+
+    const s0 = try xingSliceLast(scale, 0, 1, s);
+    defer _ = mlx.mlx_array_free(s0);
+    const s1 = try xingSliceLast(scale, 1, 2, s);
+    defer _ = mlx.mlx_array_free(s1);
+    const s2 = try xingSliceLast(scale, 2, 3, s);
+    defer _ = mlx.mlx_array_free(s2);
+
+    const pre_b = try xingSliceLast(base, 0, @intCast(HC), s);
+    defer _ = mlx.mlx_array_free(pre_b);
+    const post_b = try xingSliceLast(base, @intCast(HC), @intCast(2 * HC), s);
+    defer _ = mlx.mlx_array_free(post_b);
+    const comb_b1 = try xingSliceLast(base, @intCast(2 * HC), @intCast(MIX), s);
+    defer _ = mlx.mlx_array_free(comb_b1);
+    var comb_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(comb_b);
+    try mlx.check(mlx.mlx_reshape(&comb_b, comb_b1, &[_]c_int{ HC, HC }, 2, s));
+
+    const pre = try xingSigmoidGain(pre_w, s0, pre_b, 1.0, s);
+    defer _ = mlx.mlx_array_free(pre);
+    const post = try xingSigmoidGain(post_w, s1, post_b, 2.0, s);
+    defer _ = mlx.mlx_array_free(post);
+    const comb = try xingCombSinkhorn(comb_w4, s2, comb_b, CLAMP_MIN, CLAMP_MAX, ITERS, EPS, s);
+    defer _ = mlx.mlx_array_free(comb);
+
+    // Read back through a materialized copy: `mlx_array_data_*` reads a
+    // view's raw buffer, and the slices above are strided views.
+    const pre_host = try allocator.alloc(f32, ROWS * HC);
+    defer allocator.free(pre_host);
+    const post_host = try allocator.alloc(f32, ROWS * HC);
+    defer allocator.free(post_host);
+    const comb_host = try allocator.alloc(f32, ROWS * HC * HC);
+    defer allocator.free(comb_host);
+    try testReadF32Contig(pre, pre_host, s);
+    try testReadF32Contig(post, post_host, s);
+    try testReadF32Contig(comb, comb_host, s);
+
+    // Host reference.
+    var ref_pre: [ROWS * HC]f32 = undefined;
+    var ref_post: [ROWS * HC]f32 = undefined;
+    var ref_comb: [ROWS * HC * HC]f32 = undefined;
+    for (0..ROWS) |row| {
+        for (0..HC) |j| {
+            ref_pre[row * HC + j] = 1.0 / (1.0 + @exp(-(w_buf[row * MIX + j] * scale_buf[0] + base_buf[j])));
+            ref_post[row * HC + j] = 2.0 / (1.0 + @exp(-(w_buf[row * MIX + HC + j] * scale_buf[1] + base_buf[HC + j])));
+        }
+        var rowmax: f32 = -std.math.inf(f32);
+        for (0..HC * HC) |k| {
+            const raw = w_buf[row * MIX + 2 * HC + k] * scale_buf[2] + base_buf[2 * HC + k];
+            const clamped = @min(@max(raw, CLAMP_MIN), CLAMP_MAX);
+            ref_comb[row * HC * HC + k] = clamped;
+            rowmax = @max(rowmax, clamped);
+        }
+        for (0..HC * HC) |k| ref_comb[row * HC * HC + k] = @exp(ref_comb[row * HC * HC + k] - rowmax);
+        var it: u32 = 0;
+        while (it < ITERS) : (it += 1) {
+            for (0..HC) |i| {
+                var sum: f32 = 0;
+                for (0..HC) |j| sum += ref_comb[row * HC * HC + i * HC + j];
+                for (0..HC) |j| ref_comb[row * HC * HC + i * HC + j] /= (sum + EPS);
+            }
+            for (0..HC) |j| {
+                var sum: f32 = 0;
+                for (0..HC) |i| sum += ref_comb[row * HC * HC + i * HC + j];
+                for (0..HC) |i| ref_comb[row * HC * HC + i * HC + j] /= (sum + EPS);
+            }
+        }
+    }
+
+    for (0..ROWS * HC) |k| {
+        try testing.expect(@abs(pre_host[k] - ref_pre[k]) < 1e-6);
+        try testing.expect(@abs(post_host[k] - ref_post[k]) < 1e-6);
+    }
+    for (0..ROWS * HC * HC) |k| {
+        try testing.expect(@abs(comb_host[k] - ref_comb[k]) < 1e-5);
+    }
+    // Doubly-normalized: every row AND column sums to ~1 (the eps in the
+    // denominator pulls each sum a hair below 1).
+    // Doubly-normalized: the LAST round is a column normalization, so the
+    // columns sit at ~1 and the rows (normalized one round earlier, with the
+    // eps in each denominator) land within a hair of 1 on either side.
+    for (0..ROWS) |row| {
+        for (0..HC) |i| {
+            var sum: f32 = 0;
+            for (0..HC) |j| sum += comb_host[row * HC * HC + i * HC + j];
+            try testing.expect(@abs(sum - 1.0) < 1e-3);
+        }
+        for (0..HC) |j| {
+            var sum: f32 = 0;
+            for (0..HC) |i| sum += comb_host[row * HC * HC + i * HC + j];
+            try testing.expect(@abs(sum - 1.0) < 1e-3);
         }
     }
 }
@@ -53246,8 +53923,8 @@ test "every transformer forward path is watched by a dtype trace" {
             return error.UnwatchedForwardPath;
         }
     }
-    // standard, MoE, hybrid, BERT, Gemma3 encoder.
-    try std.testing.expectEqual(@as(usize, 6), checked);
+    // standard, MoE, hybrid, BERT, Gemma3 encoder, qwen4_exp, xing4_0.
+    try std.testing.expectEqual(@as(usize, 7), checked);
 }
 
 test "the YaRN mscale table never reaches a multiply in its load-time dtype" {

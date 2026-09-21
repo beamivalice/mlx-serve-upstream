@@ -5208,6 +5208,11 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
             (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
     }
+    if (config.isXing4()) {
+        // Both sublayers retain a BF16 stream product and an f32 norm
+        // until the next eval-cadence boundary.
+        per_tok += MOE_PREFILL_COEXIST * 2 * @as(u64, config.xing_hc_mult) * config.hidden_size * (2 + 4);
+    }
     return per_tok;
 }
 
@@ -22103,6 +22108,22 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
     const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
+}
+
+test "prefillStreamBytesPerToken: xing4_0 includes both mHC sublayers" {
+    var config = model_mod.ModelConfig{
+        .model_type = "xing4_0",
+        .xing_hc = true,
+        .xing_hc_mult = 4,
+        .hidden_size = 3584,
+        .num_experts = 64,
+        .num_experts_per_tok = 4,
+        .moe_intermediate_size = 1024,
+    };
+    const with_hc = prefillStreamBytesPerToken(&config);
+    config.xing_hc = false;
+    const without_hc = prefillStreamBytesPerToken(&config);
+    try std.testing.expectEqual(@as(u64, MOE_PREFILL_COEXIST * 2 * 4 * 3584 * 6), with_hc - without_hc);
 }
 
 test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for plain attention" {

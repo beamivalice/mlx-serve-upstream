@@ -14,6 +14,18 @@ Apache License, Version 2.0
 ================================================================================
 
 --------------------------------------------------------------------------------
+Xing4.0
+https://github.com/XingChen-AGI/Xing4.0-29B-A4B
+https://huggingface.co/XingChen-AGI/Xing4.0-29B-A4B
+Licensed under the Apache License, Version 2.0.
+
+The Xing4.0 MLA/MoE/mHC forward in src/transformer.zig follows the released
+modeling_xing4_0.py reference. Modifications by mlx-serve: native Zig/MLX-C
+implementation, in-memory BF16 expert-bank preparation, chunked prefill,
+KV-cache integration, and HTTP chat/tool-call support. Reference fixture
+generation executes the separately supplied reference implementation.
+
+--------------------------------------------------------------------------------
 MTPLX
 https://github.com/youssofal/mtplx
 Copyright 2026 Youssof Altoukhi

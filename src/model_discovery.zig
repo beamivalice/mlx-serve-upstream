@@ -40,8 +40,8 @@ const supported_model_types = [_][]const u8{
     "qwen3_5_text",     "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_moe",
     "qwen3_moe_text",   "qwen3_next",
-    "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
-    "llama",            "mistral",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
+    "llama",     "mistral",
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
@@ -52,6 +52,7 @@ const supported_model_types = [_][]const u8{
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
+    "xing4_0", // Xing4.0-29B-A4B (full MLA + MoE trunk with mHC hyper-connections)
     "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
@@ -1221,6 +1222,15 @@ test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
     try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
     // Guardrail: a regular LM must not be swept up by the prefix match.
     try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "xing4_0 is in the discovery allow-list and classifies as chat" {
+    // The same seam that stops `--model-dir` from skipping a supported
+    // checkpoint: the allow-list entry and the ModelKind mapping must both
+    // be live, and the entry must not leak into the media or drafter arms.
+    try testing.expect(isSupportedModelType("xing4_0"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("xing4_0"));
+    try testing.expect(!isMediaModelType("xing4_0"));
 }
 
 test "minimax_music3 classifies as audio media with the vocoder marker" {

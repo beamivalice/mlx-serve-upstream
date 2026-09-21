@@ -1090,6 +1090,65 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
+    // ── Xing4.0 (bare <tool_call> + param_key/param_value pairs) ───────────
+    // The checkpoint uses parameter tags rather than GLM's arg_key spelling.
+    // Values are emitted raw for strings and through tojson for non-strings.
+    .{
+        .family = "xing4",
+        .name = "param_key/param_value call after template-opened thinking",
+        .raw = "I will check Tokyo.</think>\n" ++
+            "<tool_call>get_weather" ++
+            "<param_key>city</param_key><param_value>Tokyo</param_value>" ++
+            "<param_key>days</param_key><param_value>3</param_value>" ++
+            "<param_key>metric</param_key><param_value>true</param_value>" ++
+            "</tool_call>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = pythonic_weather_tool_schema,
+        .reasoning_contains = "check Tokyo",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "metric",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "xing4",
+        .name = "a JSON-looking string parameter retains its bytes",
+        .raw = "<tool_call>write_file<param_key>content</param_key><param_value>  true\n</param_value></tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "  true\n",
+    },
+    .{
+        .family = "xing4",
+        .name = "bare parameterless call still recovers its name",
+        .raw = "<tool_call>list_files</tool_call>",
+        .tool_name = "list_files",
+    },
+    .{
+        .family = "xing4",
+        .name = "param_value keeps whitespace and wrapper-close text",
+        .raw = "<tool_call>write_file" ++
+            "<param_key>content</param_key><param_value>  first\n" ++
+            "</tool_call> is literal  \n</param_value>" ++
+            "</tool_call>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "  first\n</tool_call> is literal  \n",
+    },
+    .{
+        .family = "xing4",
+        .name = "truncated param_value recovers only closed pairs",
+        .raw = "<tool_call>write" ++
+            "<param_key>path</param_key><param_value>novel.txt</param_value>" ++
+            "<param_key>content</param_key><param_value>Chapter 1 starts but the",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
     // ── K2-Horizon (IFM) ────────────────────────────────────────────────
     // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
     // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
@@ -2185,7 +2244,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:",
+        "<｜DSML｜",
+        "<function",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
