@@ -6,7 +6,7 @@
 //! the per-head gated RMS norm for a 1024 block (8 heads) and rotates it for
 //! out_proj. Bit-identical to the composed chain.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 const HEADER =
     \\inline float msv_log1p(float x) {

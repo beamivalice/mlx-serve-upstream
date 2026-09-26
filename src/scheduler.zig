@@ -32,7 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -57,8 +57,8 @@ const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
 const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const log = @import("log.zig");
-const io_util = @import("io_util.zig");
+const log = @import("log");
+const io_util = @import("io_util");
 const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 
@@ -3811,7 +3811,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
         const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
         if (n > 0) {
-            const io_u = @import("io_util.zig");
+            const io_u = @import("io_util");
             const tio = std.Io.Threaded.global_single_threaded.io();
             var ctx = xfm_ptr.defaultCtx();
             // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards

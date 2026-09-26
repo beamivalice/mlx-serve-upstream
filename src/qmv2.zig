@@ -6,7 +6,7 @@
 //! exact inputs, so the error is stock's; qmv_fast is ALU co-bound at 2 bits
 //! and this is not (1.45x on the 5120x17408 MLP shapes, M4 Max).
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 /// Codes (j, j+8) of `u` as exact half2 integers, minus `o`.
 const DECODE =

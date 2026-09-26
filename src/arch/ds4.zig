@@ -19,7 +19,7 @@ const std = @import("std");
 const gguf_meta = @import("../gguf_meta.zig");
 const ffi = @import("../ds4_ffi.zig");
 const metal_sources = @import("ds4_metal_sources");
-const log = @import("../log.zig");
+const log = @import("log");
 
 pub const Error = error{
     EngineOpenFailed,

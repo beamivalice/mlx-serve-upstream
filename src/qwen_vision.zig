@@ -10,11 +10,11 @@
 //! Gemma 4's fixed 280.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
-const log = @import("log.zig");
+const log = @import("log");
 
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
 /// processor metadata overrides these when present.

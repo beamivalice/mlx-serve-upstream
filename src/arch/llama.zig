@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const ffi = @import("../llama_ffi.zig");
-const log = @import("../log.zig");
+const log = @import("log");
 
 pub const Error = error{
     EngineOpenFailed,

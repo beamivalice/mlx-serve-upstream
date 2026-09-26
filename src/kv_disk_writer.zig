@@ -5,7 +5,7 @@
 //! bytes for a directory about to be removed. POSIX syscalls: this runs off the main thread.
 
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 
 /// One staged file; both buffers are owned by the queue once `submit` accepts them.
 pub const Blob = struct {

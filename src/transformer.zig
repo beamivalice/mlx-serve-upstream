@@ -7,7 +7,7 @@ const qwen4_mod = @import("qwen4_exp.zig");
 // so has no head-shaped state of its own. mtp.zig imports this file back for
 // `Transformer`; neither type closes a comptime loop.
 const mtp_mod = @import("mtp.zig");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const mrope = @import("mrope.zig");
 const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
@@ -6951,8 +6951,8 @@ pub fn splitMaskedSdpa256(
 }
 
 const model_mod = @import("model.zig");
-const log = @import("log.zig");
-const io_util_mod = @import("io_util.zig");
+const log = @import("log");
+const io_util_mod = @import("io_util");
 const round_cost_mod = @import("round_cost.zig");
 const group_cost_mod = @import("mtp_group_cost.zig");
 // NB `ane_offload`, not `*_mod`: the `?*<x>_mod.<Y>` field convention marks
@@ -16900,7 +16900,7 @@ pub const Transformer = struct {
     /// op responsible. Dense-bf16 attention only (quantized attention is
     /// skipped — `qmatmul` is a different path).
     pub fn diagProjBench(self: *Transformer, iters: usize, ctx: *ForwardCtx) void {
-        const io_u = @import("io_util.zig");
+        const io_u = @import("io_util");
         const tio = std.Io.Threaded.global_single_threaded.io();
         const ml = self.moe_layers orelse return;
         const HID: c_int = @intCast(self.config.hidden_size);
@@ -48852,7 +48852,7 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
     // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
     // if it matches, the gap is the live server context (stream/alloc/pipeline).
     if (std.c.getenv("MLX_SERVE_MOE_GATHER_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -49459,7 +49459,7 @@ test "Laguna-XS decode µbench: bf16 attention projections (MLX_SERVE_LAGUNA_UBE
     // it manufactures a bandwidth floor far below the real one and makes the
     // live path look pathological by comparison.
     if (std.c.getenv("MLX_SERVE_LAGUNA_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -49627,7 +49627,7 @@ test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
     // 16 wastes half the 32-row tile). The limit is a per-shape number, so the
     // cliff is what this prints — a whole-model per-round estimate at each M.
     if (std.c.getenv("MLX_SERVE_VERIFY_WIDTH_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -49725,7 +49725,7 @@ test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
 
 test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)" {
     if (std.c.getenv("MLX_SERVE_VQMM_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -49867,7 +49867,7 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
 test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
     if (std.c.getenv("MLX_SERVE_VQMM_MIXED_UBENCH") == null) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -50016,7 +50016,7 @@ test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
 
 test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (MLX_SERVE_PREFILL_QMM_UBENCH=1)" {
     if (std.c.getenv("MLX_SERVE_PREFILL_QMM_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -50132,7 +50132,7 @@ test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; MLX
     // real Qwen3.6-27B geometry. Run with:
     //   MLX_SERVE_GDN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="GDN µbench"
     if (std.c.getenv("MLX_SERVE_GDN_UBENCH") == null) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const B: c_int = 1;
@@ -54031,7 +54031,7 @@ test "lm-head prune: assembled row — argmax == dense, candidates bit-identical
 test "lm-head prune µbench: dense vs coarse vs full pipeline at Laguna XS geometry (MLX_SERVE_LMHEAD_UBENCH=1)" {
     const raw = std.c.getenv("MLX_SERVE_LMHEAD_UBENCH") orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1")) return error.SkipZigTest;
-    const io_util = @import("io_util.zig");
+    const io_util = @import("io_util");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xBE9C);
     const rnd = prng.random();

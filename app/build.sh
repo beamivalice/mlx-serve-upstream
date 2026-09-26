@@ -190,6 +190,7 @@ ZIG_DEVELOPER_DIR=/Library/Developer/CommandLineTools
 # MLX + ggml self-report at runtime; these three have no runtime API:
 MLXC_VERSION="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
 DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
+SUSHI_COMMIT="$(git -C "$PROJECT_ROOT/lib/sushi" rev-parse --short HEAD 2>/dev/null)"
 LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
 # ReleaseFast unless ZIG_DEBUG asked otherwise (see the lever's comment at the
 # top). Even under FAST_DEV the default stays ReleaseFast: Zig's cache already
@@ -201,7 +202,7 @@ if [ "$ZIG_DEBUG" = "1" ]; then
     echo "  (ZIG_DEBUG=1 — mlx-serve built Debug: 2-4x slower decode, never read a latency off it)"
 fi
 DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build "${ZIG_OPT[@]}" -Dversion="$MLX_SERVE_VERSION" \
-  -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
+  -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dsushi-commit="${SUSHI_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
   ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
 # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
 DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1

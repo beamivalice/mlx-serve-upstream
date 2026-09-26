@@ -40,8 +40,8 @@
 //! as mflux's `FusedLoRALinear`.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 
 /// Non-owning adapter reference installed on a linear layer. `at`/`bt` are
 /// pre-transposed bf16 so the hot path is two plain matmuls.

@@ -23,7 +23,7 @@
 //!     the Swift Settings pane carries the disclosure.
 
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";
 

@@ -16,7 +16,7 @@
 // quantized-attention kernels key on the affine triple (`transformer.zig`).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 /// KV-cache storage scheme.
 ///   * `off`      — dense bf16.

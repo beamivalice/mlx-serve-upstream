@@ -22,7 +22,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const ollama = @import("ollama.zig");
 const model_discovery = @import("model_discovery.zig");
-const log = @import("log.zig");
+const log = @import("log");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 

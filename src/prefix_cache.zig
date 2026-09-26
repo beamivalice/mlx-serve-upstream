@@ -15,13 +15,13 @@
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const transformer_mod = @import("transformer.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
-const io_util = @import("io_util.zig");
-const log = @import("log.zig");
+const io_util = @import("io_util");
+const log = @import("log");
 const restore_dump = @import("restore_dump.zig");
 
 const KVCache = transformer_mod.KVCache;

@@ -21,8 +21,8 @@
 //! `video_vae/transformer/fallback_na/eager.py`.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const geom = @import("ltx_diffvae.zig");
 
 const S = mlx.mlx_stream;

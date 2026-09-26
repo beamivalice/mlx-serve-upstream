@@ -7,7 +7,7 @@
 //! `rawEmbedding` apply them. The input transform is memoized on (x, signs):
 //! q/k/v, gate/up and the GDN qkv/z share one normed activation.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 pub const SIGNS_SUFFIX = ".signs";
 

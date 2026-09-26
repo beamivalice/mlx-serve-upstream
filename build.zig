@@ -103,6 +103,7 @@ pub fn build(b: *std.Build) void {
     //                    still reports it. app/build.sh passes all three.
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
+    const sushi_commit = b.option([]const u8, "sushi-commit", "Pinned sushi submodule short commit (the EXL3 engine)") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
     const build_options = b.addOptions();
@@ -110,6 +111,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "mas", mas);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "ds4_commit", ds4_commit);
+    build_options.addOption([]const u8, "sushi_commit", sushi_commit);
     build_options.addOption([]const u8, "llama_tag", llama_tag);
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
@@ -138,6 +140,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const shared = sharedModules(b, target, optimize);
+
+    // One module owns the pinned format files; shared imports are explicit
+    // on the child because module import maps are not inherited.
+    const sushi_exl3 = b.createModule(.{
+        .root_source_file = b.path("lib/sushi_exl3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "log", .module = shared.log },
+            .{ .name = "mlx", .module = shared.mlx },
+            .{ .name = "io_util", .module = shared.io_util },
+        },
+    });
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -145,7 +162,11 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "log", .module = shared.log },
+            .{ .name = "mlx", .module = shared.mlx },
+            .{ .name = "io_util", .module = shared.io_util },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "sushi_exl3", .module = sushi_exl3 },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
@@ -193,7 +214,7 @@ pub fn build(b: *std.Build) void {
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
     // enabled (the Homebrew bottle ships without them). MUST come before the
     // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
-    addMlxLib(b, mod);
+    addMlxLib(b, mod, shared);
     // webp include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -233,7 +254,11 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "log", .module = shared.log },
+            .{ .name = "mlx", .module = shared.mlx },
+            .{ .name = "io_util", .module = shared.io_util },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "sushi_exl3", .module = sushi_exl3 },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
@@ -254,7 +279,7 @@ pub fn build(b: *std.Build) void {
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
-    addMlxLib(b, test_mod);
+    addMlxLib(b, test_mod, shared);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("webp", .{});
@@ -366,6 +391,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption(bool, "mas", false);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
     build_options.addOption([]const u8, "ds4_commit", "unknown");
+    build_options.addOption([]const u8, "sushi_commit", "unknown");
     build_options.addOption([]const u8, "llama_tag", "unavailable (macOS-only engine)");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
@@ -377,6 +403,8 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .optimize = optimize,
     });
 
+    const shared = sharedModules(b, target, optimize);
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -384,6 +412,9 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "log", .module = shared.log },
+            .{ .name = "mlx", .module = shared.mlx },
+            .{ .name = "io_util", .module = shared.io_util },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
@@ -410,7 +441,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
 
     // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
-    addMlxLib(b, mod);
+    addMlxLib(b, mod, shared);
     // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
     // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
     mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
@@ -549,9 +580,11 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption(bool, "macos_engines", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
+    ios_options.addOption([]const u8, "sushi_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
 
+    const shared = sharedModules(b, ios_target, .ReleaseFast);
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),
         .target = ios_target,
@@ -560,6 +593,9 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = ios_options.createModule() },
+            .{ .name = "log", .module = shared.log },
+            .{ .name = "mlx", .module = shared.mlx },
+            .{ .name = "io_util", .module = shared.io_util },
         },
     });
 
@@ -767,6 +803,24 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     });
 }
 
+/// Shared modules keep one logger and one MLX binding namespace per graph.
+const SharedModules = struct {
+    log: *std.Build.Module,
+    mlx: *std.Build.Module,
+    io_util: *std.Build.Module,
+};
+
+/// One instance per (target, optimize) pair, since a module is compiled for
+/// its own. No C sources, include paths or link flags: the roots own those.
+fn sharedModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) SharedModules {
+    const log_mod = b.createModule(.{ .root_source_file = b.path("src/log.zig"), .target = target, .optimize = optimize });
+    const mlx_mod = b.createModule(.{ .root_source_file = b.path("src/mlx.zig"), .target = target, .optimize = optimize });
+    // mlx.zig logs, so the shared mlx module needs the shared log module.
+    mlx_mod.addImport("log", log_mod);
+    const io_util_mod = b.createModule(.{ .root_source_file = b.path("src/io_util.zig"), .target = target, .optimize = optimize });
+    return .{ .log = log_mod, .mlx = mlx_mod, .io_util = io_util_mod };
+}
+
 /// Link the self-built mlx + mlx-c staged in lib/mlx by scripts/build-mlx.sh
 /// (pinned submodules lib/mlx-src + lib/mlxc-src, deployment target 26.2 so
 /// MLX's NAX kernels are compiled in — the Homebrew bottle ships without them
@@ -774,8 +828,10 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
 /// @rpath/...; the build-tree rpath resolves them in dev, release.yml /
 /// app/build.sh rewrite to @executable_path and re-sign for bundles.
 /// Guard test: tests/test_mlx_staged_nax.sh.
-fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+fn addMlxLib(b: *std.Build, module: *std.Build.Module, shared: SharedModules) void {
     module.addIncludePath(b.path("lib/mlx/include"));
+    // Keep the pinned headers available to the bindings module too.
+    shared.mlx.addIncludePath(b.path("lib/mlx/include"));
     module.addLibraryPath(b.path("lib/mlx/lib"));
     // use_pkg_config = .no: a leftover Homebrew mlx-c must never hijack this
     // link — we want exactly the staged NAX-enabled pair (same class as the

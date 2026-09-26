@@ -16,8 +16,8 @@
 //! Q rotates with `offset = target.cache.step + 1`; K is already RoPE'd by target.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 

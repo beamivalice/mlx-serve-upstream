@@ -21,8 +21,8 @@
 //!   attn_dino.to_out.bias — identical in A and B, so the algebra holds.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const hy3d = @import("hunyuan3d.zig");
 
 const S = mlx.mlx_stream;

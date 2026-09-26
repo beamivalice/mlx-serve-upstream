@@ -14,7 +14,7 @@
 //! SSE writes to the parked connection are single-writer-safe.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
 const mage_flow_mod = @import("mage_flow.zig");
@@ -37,7 +37,7 @@ const png_mod = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
-const log = @import("log.zig");
+const log = @import("log");
 const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");

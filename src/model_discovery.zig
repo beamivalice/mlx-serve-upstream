@@ -13,7 +13,7 @@
 //! plan 01 Phase 0 (detangling Transformer state).
 
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");

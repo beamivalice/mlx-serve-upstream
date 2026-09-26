@@ -7,8 +7,8 @@
 //! Convs (VAE only) are bf16 in MLX OHWI layout already.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const lora_mod = @import("lora.zig");

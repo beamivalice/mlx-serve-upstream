@@ -21,8 +21,8 @@
 //! tiny random-weight pack through the same code.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const sse = @import("gen_sse.zig");
 const model_mod = @import("model.zig");
 const tok_mod = @import("tokenizer.zig");

@@ -8,8 +8,8 @@
 //! `model.safetensors` with MLX parameter names. No top-level config.json.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const ltx = @import("ltx_video.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 

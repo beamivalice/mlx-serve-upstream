@@ -13,8 +13,8 @@
 //! f32 (the reference decodes in f32); encoder + DiT run in bf16.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const png = @import("png.zig");

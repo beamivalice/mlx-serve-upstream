@@ -1,7 +1,7 @@
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const transformer_mod = @import("transformer.zig");
-const log = @import("log.zig");
+const log = @import("log");
 
 const KVCache = transformer_mod.KVCache;
 const SSMCacheEntry = transformer_mod.SSMCacheEntry;

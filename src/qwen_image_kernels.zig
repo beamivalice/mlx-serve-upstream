@@ -1,6 +1,6 @@
 //! Optional Qwen-Image-2.1 kernels; callers retain an unfused fallback.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 

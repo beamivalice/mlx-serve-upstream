@@ -1,6 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
@@ -23,7 +23,7 @@ const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") el
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
-const log = @import("log.zig");
+const log = @import("log");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
@@ -588,6 +588,7 @@ pub fn main(init: std.process.Init) !void {
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
                 .ds4_commit = build_options.ds4_commit,
+                .sushi_commit = build_options.sushi_commit,
             };
             var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writer(io, &ver_buf);

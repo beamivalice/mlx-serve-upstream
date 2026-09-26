@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const log = @import("log.zig");
+const log = @import("log");
 
 const is_macos = builtin.os.tag == .macos;
 

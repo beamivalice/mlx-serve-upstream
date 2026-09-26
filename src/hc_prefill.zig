@@ -1,6 +1,6 @@
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var sigmoid_table: ?mlx.mlx_array = null;

@@ -1,6 +1,6 @@
 const std = @import("std");
-const log = @import("log.zig");
-const io_util = @import("io_util.zig");
+const log = @import("log");
+const io_util = @import("io_util");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 

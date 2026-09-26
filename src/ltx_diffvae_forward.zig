@@ -15,12 +15,12 @@
 //! `video_vae/transformer/{blocks,layers,swiglu,rope_math,combined/*}.py`.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const ltx = @import("ltx_video.zig");
 const geom = @import("ltx_diffvae.zig");
 const na = @import("ltx_diffvae_kernel.zig");
-const io_util = @import("io_util.zig");
+const io_util = @import("io_util");
 const status = @import("status.zig");
 
 const S = mlx.mlx_stream;

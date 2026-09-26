@@ -24,10 +24,10 @@
 //! cache, no batched decode.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model = @import("model.zig");
 const transformer = @import("transformer.zig");
-const log = @import("log.zig");
+const log = @import("log");
 
 const ModelConfig = model.ModelConfig;
 const QuantParams = transformer.QuantParams;

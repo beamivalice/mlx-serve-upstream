@@ -5,7 +5,7 @@
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
-const log = @import("log.zig");
+const log = @import("log");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
 pub const Override = struct {

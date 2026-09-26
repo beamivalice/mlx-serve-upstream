@@ -9,7 +9,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const model_mod = @import("model.zig");
 const mtp_mod = @import("mtp.zig");
-const log = @import("log.zig");
+const log = @import("log");
 
 const DONOR_REPO = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit";
 const SIDECAR = "mtp.safetensors";

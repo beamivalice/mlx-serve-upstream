@@ -18,9 +18,9 @@
 //! Ported from ComfyUI `comfy/ldm/minimax/audio_vae.py`.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
-const log = @import("log.zig");
+const log = @import("log");
 const ltxa = @import("ltx_audio.zig");
 
 const Weights = model_mod.Weights;

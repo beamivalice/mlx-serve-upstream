@@ -5,7 +5,7 @@
 # Why this exists: a submodule can silently drift off its pin — a stray
 # `git checkout` inside lib/<sub>, an interrupted bump, a rebase that moved the
 # gitlink but not the working tree. A drifted ENGINE submodule (lib/ds4,
-# lib/mlx-src, lib/mlxc-src) either fails to compile with a cryptic missing-file
+# lib/sushi, lib/mlx-src, lib/mlxc-src) either fails to compile with a cryptic missing-file
 # error, or worse compiles against a different struct ABI and corrupts at
 # runtime. This is the one guard that catches it before the build does.
 #

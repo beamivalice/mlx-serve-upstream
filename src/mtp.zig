@@ -28,12 +28,12 @@
 //! (src/generate.zig); deleting the feature is removing those two.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
-const log = @import("log.zig");
-const io_util_mod = @import("io_util.zig");
+const log = @import("log");
+const io_util_mod = @import("io_util");
 const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;

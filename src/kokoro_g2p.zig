@@ -21,7 +21,7 @@
 //! known, bounded quality gap, not a correctness bug — see `resolveEntry`.
 
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 
 pub const Phonemizer = struct {
     allocator: std.mem.Allocator,

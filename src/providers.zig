@@ -9,7 +9,7 @@
 //! Transport is the system `curl` (TLS, HTTP/2, proxies for free — the same
 //! choice `cli.zig` made for Hugging Face).
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 const lan = @import("lan.zig");
 
 pub const Model = lan.PeerModel;

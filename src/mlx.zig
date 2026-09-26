@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const log = @import("log.zig");
+const log = @import("log");
 
 // ── Opaque handle types ──
 pub const mlx_array = extern struct { ctx: ?*anyopaque = null };

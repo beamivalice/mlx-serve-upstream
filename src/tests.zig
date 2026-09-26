@@ -2,7 +2,7 @@
 // Run with: zig build test
 
 test {
-    _ = @import("log.zig");
+    _ = @import("log");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
@@ -38,6 +38,11 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
+    _ = @import("arch/exl3.zig");
+    // The pinned EXL3 engine is compiled into this test binary (its module is
+    // bound above), so a change that breaks the binding fails here. Its own
+    // tests stay in its suite: a module's tests are not collected by the root.
+    _ = @import("sushi_exl3").format.TILE;
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
     _ = @import("kokoro_g2p.zig");
@@ -96,5 +101,5 @@ test {
     _ = @import("launch.zig");
     _ = @import("lan.zig");
     _ = @import("providers.zig");
-    _ = @import("mlx.zig");
+    _ = @import("mlx");
 }

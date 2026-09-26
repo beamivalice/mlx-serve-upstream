@@ -32,7 +32,7 @@ const build_options = @import("build_options");
 // engine panics (ds4/llama unavailable on iOS) are never reached at runtime
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -40,7 +40,7 @@ const model_registry_mod = @import("model_registry.zig");
 const scheduler_mod = @import("scheduler.zig");
 const server_mod = @import("server.zig");
 const gen_mod = @import("gen.zig");
-const log = @import("log.zig");
+const log = @import("log");
 
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {

@@ -35,8 +35,8 @@
 //!   transform uses the reference's /(R+1) off-by-one (NOT /R).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const mc = @import("marching_cubes.zig");

@@ -20,8 +20,8 @@
 //! layout at use (see `conv1d`/`conv2d`/`convTranspose1d`).
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const ltx = @import("ltx_video.zig");
 
 const S = mlx.mlx_stream;
