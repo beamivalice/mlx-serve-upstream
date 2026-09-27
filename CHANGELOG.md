@@ -26,6 +26,7 @@
 - Nemotron-H 3.5 MoE checkpoints load (#559).
 - A second server refuses a port already in use instead of silently sharing it (#569).
 - Qwen3.8 Flash Next GGUFs route to the engine that can load them (#546).
+- `--mtp-greedy-tail` (or `"mtp_greedy_tail": true` for one model in model-settings.json) drafts only the first speculative token of a sampled request by sampling and the rest by argmax, which lets `--mtp-typical` accept longer runs; off by default.
 
 ## v26.9.6 — Every Image Seen - Laya Decisions - Steady Qwen3.8 Agents
 

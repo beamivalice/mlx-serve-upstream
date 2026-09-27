@@ -54,6 +54,14 @@ pub var prefill_trace_force: bool = false;
 /// override it through InitOptions; exact remains the library default.
 pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
 
+/// `--mtp-greedy-tail`, set once by the serve CLI.
+pub var mtp_greedy_tail_default: bool = false;
+
+/// THIS model's greedy tail: its `mtp_greedy_tail` outranks `--mtp-greedy-tail`.
+pub fn mtpGreedyTailFor(override: ?bool) bool {
+    return override orelse mtp_greedy_tail_default;
+}
+
 /// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
 pub fn envPrefillChunk() usize {
     return readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
@@ -1477,6 +1485,8 @@ pub const Generator = struct {
     mtp_accept_graph: MtpGraphFn = mtpBatchedExactGraph,
     mtp_accept_prefix: mtp_acceptance.PrefixFn = mtp_acceptance.exactPrefix,
     mtp_accept_param: f32 = 0,
+    /// A sampled request drafts only depth 0 from the draft sampler, every later depth by argmax.
+    mtp_greedy_tail: bool = false,
     /// A row-exact trunk verifies sampled rounds with the serial sampler itself:
     /// row i draws with the key serial decoding uses at that position and a
     /// draft stays only when it is that draw, so the stream is serial's.
@@ -2131,6 +2141,7 @@ pub const Generator = struct {
         mtp_enabled: bool = false,
         /// Explicit verifier selected by the caller at construction.
         mtp_acceptance: mtp_acceptance.Mode = .exact,
+        mtp_greedy_tail: bool = false,
         /// Non-owning pointer to the loaded MTP head.
         mtp: ?MtpHeadRef = null,
         /// The model's head before this request's opt-out (the qwen4 weights load with the trunk regardless).
@@ -2542,6 +2553,8 @@ pub const Generator = struct {
                 .exact => unreachable,
             }
         }
+        if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling, mtpDraftProposalEnv()))
+            log.info("  [mtp-draft] greedy tail engaged: depth 0 samples, later depths take the head's argmax\n", .{});
         var mtp_cache: ?MtpCacheRef = null;
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
@@ -3248,6 +3261,7 @@ pub const Generator = struct {
                 .mtp_accept_graph = accept_route.graph,
                 .mtp_accept_prefix = accept_route.prefix,
                 .mtp_accept_param = accept_route.param,
+                .mtp_greedy_tail = options.mtp_greedy_tail,
                 .mtp_serial_accept = mtp_active and xfm.config.rowExactDecode() and std.meta.activeTag(options.mtp_acceptance) == .exact,
                 .mtp_cache = mtp_cache,
                 .mtp_position_base = mtp_position_base,
@@ -5876,7 +5890,9 @@ pub const Generator = struct {
     /// Allocate one request-local categorical draw index while the lazy MTP
     /// graph is built. The same counter covers draft and correction samples,
     /// including cross-round pre-drafts, so no two keyed draws reuse a key.
+    /// An argmax draft draws nothing.
     fn mtpSamplingDraw(self: *Generator, params: SamplingParams) SamplingParams {
+        if (params.temperature <= 0.01) return params;
         var draw = params;
         draw.draw = self.sampling.draw;
         self.sampling.draw +%= 1;
@@ -5906,7 +5922,8 @@ pub const Generator = struct {
         /// Chunk-A log-confidence graphs (two-chunk plans only). len m_lo.
         conf_arrs: ?[]mlx.mlx_array,
         n_conf: u32,
-        /// Sharp-draft proposal distributions q. len m_hi; [0..n_qp) valid.
+        /// Proposal densities q, present when depth 0 samples; an argmax
+        /// depth's row is its one-hot. len m_hi; [0..n_qp) valid.
         q_probs: ?[]mlx.mlx_array,
         n_qp: u32,
         /// Chain hidden after the last built step (owned) — a chunk-B
@@ -5942,7 +5959,7 @@ pub const Generator = struct {
     /// Allocate an empty draft chain for `plan` (nothing built yet).
     fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
         const consider_ext = plan.m_hi > plan.m_lo;
-        const sharp_drafts = self.mtpDraftSampling().temperature > 0.01;
+        const sharp_drafts = self.mtpDraftSampling(0).temperature > 0.01;
         const drafts = try allocator.alloc(u32, plan.m_hi);
         errdefer allocator.free(drafts);
         const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
@@ -6376,12 +6393,12 @@ pub const Generator = struct {
         const s = xfm.s;
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
-        const draft_sampling = self.mtpDraftSampling();
         const mtp_mrope_ctx = self.mtpMropeContext();
         const rerank_drafts = self.mtpRerankDrafts();
         std.debug.assert(chain.n_drafted == from);
         var i: u32 = from;
         while (i < to) : (i += 1) {
+            const draft_sampling = self.mtpDraftSampling(i);
             const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
             const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
             // Rerank drafts skip the head's own logits projection entirely:
@@ -6389,7 +6406,7 @@ pub const Generator = struct {
             // greedily (argmax) or sampled from a q over those 32 rows.
             const path = mtpDraftStepPath(
                 rerank_drafts,
-                chain.q_probs != null,
+                draft_sampling.temperature > 0.01,
                 chain.conf_arrs != null and i < chain.plan.m_lo,
             );
             const use_rerank = path != .full_logits;
@@ -6446,36 +6463,32 @@ pub const Generator = struct {
             defer if (step_out.rerank_x.ctx != null) {
                 _ = mlx.mlx_array_free(step_out.rerank_x);
             };
-            if (path == .rerank_sampled) {
+            if (use_rerank and chain.q_probs != null) {
                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                 const slots = chain.q_probs.?;
                 if (try head.draftShortlist(xfm, rerank_x, draft_sampling.suppress_mask)) |shortlist| {
                     var sl = shortlist;
                     defer sl.deinit();
-                    const prop = try shortlistProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
+                    const prop = try shortlistStepProposal(sl, self.mtpSamplingDraw(draft_sampling), s);
                     chain.draft_arrs[i] = prop.id;
                     slots[i] = prop.q;
                 } else {
                     // The coarse head just retired: propose greedily and hand
                     // the verify the one-hot q that proposal really has.
                     const id = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
-                    errdefer _ = mlx.mlx_array_free(id);
-                    slots[i] = try lazyOneHotRow(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
-                    chain.draft_arrs[i] = id;
+                    const prop = try argmaxStepProposal(id, @intCast(mlx.getShape(xfm.lm_head_w)[0]), s);
+                    chain.draft_arrs[i] = prop.id;
+                    slots[i] = prop.q;
                 }
                 chain.n_qp = i + 1;
             } else if (use_rerank) {
                 const rerank_x = if (step_out.rerank_x.ctx != null) step_out.rerank_x else step_out.hidden_next;
                 chain.draft_arrs[i] = try head.draftSelect(xfm, rerank_x, draft_sampling.suppress_mask);
             } else if (chain.q_probs) |slots| {
-                // Sharp proposal: q = filtered softmax of the draft-head
-                // logits at the FIXED sharpened constants; the draft is
-                // sampled from exactly this distribution (log+categorical
-                // == categorical over the filtered logits), so the q used
-                // in the accept ratio is the true proposal density.
-                slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
+                const prop = try logitsStepProposal(step_out.logits, self.mtpSamplingDraw(draft_sampling), s);
+                slots[i] = prop.q;
                 chain.n_qp = i + 1;
-                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], self.mtpSamplingDraw(draft_sampling), s);
+                chain.draft_arrs[i] = prop.id;
             } else if (self.mtpCoupledDrafts()) {
                 // The verify row's own keyed draw over the head's logits.
                 var sp = self.sampling;
@@ -6622,11 +6635,11 @@ pub const Generator = struct {
         }
     }
 
-    /// One draft step for a group whose rerank rows include sampled ones:
+    /// One draft step for a group whose rerank rows include sampled chains:
     /// per-row shortlists off ONE coarse readout, then one batched proposal
-    /// over the sampled rows when they share a sampler and none is seeded
-    /// (the `sampleRowsLazy` gate), else one proposal per row. Greedy rerank
-    /// rows keep their argmax.
+    /// over the rows that sample this depth when they share a sampler and none
+    /// is seeded (the `sampleRowsLazy` gate), else one proposal per row. Every
+    /// other row takes its argmax.
     fn mtpGroupSampledDrafts(
         gens: []const *Generator,
         chains: []MtpPreDraft,
@@ -6649,12 +6662,12 @@ pub const Generator = struct {
                 const xsh = mlx.getShape(stacked_x);
                 try mlx.check(mlx.mlx_slice(&xk, stacked_x, &[_]c_int{ k_c, 0, 0 }, 3, &[_]c_int{ k_c + 1, 1, xsh[xsh.len - 1] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
                 const id = try g.mtp.?.draftSelect(xfm, xk, g.sampling.suppress_mask);
-                errdefer _ = mlx.mlx_array_free(id);
                 if (c.q_probs) |slots| {
-                    slots[step] = try lazyOneHotRow(id, vocab, s);
+                    const prop = try argmaxStepProposal(id, vocab, s);
+                    c.draft_arrs[step] = prop.id;
+                    slots[step] = prop.q;
                     c.n_qp = step + 1;
-                }
-                c.draft_arrs[step] = id;
+                } else c.draft_arrs[step] = id;
                 c.n_drafted = step + 1;
             }
             return;
@@ -6664,20 +6677,28 @@ pub const Generator = struct {
         // Which rows sample, and whether one batched draw can serve them all.
         var sampled: [32]usize = undefined;
         var params: [32]SamplingParams = undefined;
+        var samples: [32]bool = @splat(false);
         var k_sampled: usize = 0;
         for (gens, chains, 0..) |g, *c, row| {
-            if (c.q_probs == null) continue;
+            const row_params = g.mtpDraftSampling(step);
+            if (c.q_probs == null or row_params.temperature <= 0.01) continue;
+            samples[row] = true;
             sampled[k_sampled] = row;
-            params[k_sampled] = g.mtpDraftSampling();
+            params[k_sampled] = row_params;
             k_sampled += 1;
         }
         const batched = k_sampled > 1 and
             sampleRowsHomogeneous(params[0..k_sampled]) and
             !sampleRowsAnySeed(params[0..k_sampled]);
 
-        for (chains, 0..) |*c, row| {
-            if (c.q_probs != null) continue;
-            c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
+        for (gens, chains, 0..) |g, *c, row| {
+            if (samples[row]) continue;
+            if (c.q_probs) |slots| {
+                const prop = try shortlistStepProposal(shortlists[row], g.mtpDraftSampling(step), s);
+                c.draft_arrs[step] = prop.id;
+                slots[step] = prop.q;
+                c.n_qp = step + 1;
+            } else c.draft_arrs[step] = try mtp_mod.shortlistArgmax(s, shortlists[row]);
             c.n_drafted = step + 1;
         }
         if (!batched) {
@@ -6890,11 +6911,12 @@ pub const Generator = struct {
                 }
             } else {
                 for (gens, chains, 0..) |g, *c, k| {
-                    const draft_sampling = g.mtpDraftSampling();
+                    const draft_sampling = g.mtpDraftSampling(i);
                     if (c.q_probs) |slots| {
-                        slots[i] = try probsAtLastPos(outs[k].logits, draft_sampling, xfm.s);
+                        const prop = try logitsStepProposal(outs[k].logits, g.mtpSamplingDraw(draft_sampling), xfm.s);
+                        slots[i] = prop.q;
                         c.n_qp = i + 1;
-                        c.draft_arrs[i] = try sampleFromProbsLazy(slots[i], g.mtpSamplingDraw(draft_sampling), xfm.s);
+                        c.draft_arrs[i] = prop.id;
                     } else {
                         c.draft_arrs[i] = sampleTokenLazy(outs[k].logits, draft_sampling, xfm.s);
                     }
@@ -8954,6 +8976,12 @@ pub const Generator = struct {
         };
     }
 
+    /// Greedy drafts at chain depth `step` (0 = the round's first draft). The
+    /// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
+    pub fn mtpDraftGreedyAt(target: SamplingParams, mode: DraftProposal, greedy_tail: bool, step: u32) bool {
+        return mtpDraftGreedyFor(target, mode) or (greedy_tail and step > 0);
+    }
+
     // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
     // Drafts for a stochastic target are SAMPLED from a fixed sharper
     // distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
@@ -9010,13 +9038,14 @@ pub const Generator = struct {
         return d;
     }
 
-    /// This request's draft sampler: the per-request proposal mode and the
-    /// loaded family's draft temperature, resolved in ONE place so no call site
-    /// can read a different proposal than the one the verify's q came from.
-    pub fn mtpDraftSampling(self: *const Generator) SamplingParams {
+    /// This request's draft sampler at chain depth `step`: the per-request
+    /// proposal mode, the greedy tail and the loaded family's draft temperature,
+    /// resolved in ONE place so no call site can read a different proposal than
+    /// the one the verify's q came from.
+    pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
         return mtpDraftSamplingFor(
             self.sampling,
-            self.mtp_serial_accept or mtpDraftGreedyFor(self.sampling, mtpDraftProposalEnv()),
+            self.mtp_serial_accept or mtpDraftGreedyAt(self.sampling, mtpDraftProposalEnv(), self.mtp_greedy_tail, step),
             mtpDraftTempFor(&self.xfm.config),
         );
     }
@@ -11052,7 +11081,7 @@ pub const Generator = struct {
     /// One debug line per planned round with every input the planner read.
     pub fn mtpPlannerMode(self: *const Generator) u8 {
         if (self.mtp == null) return 0;
-        const sharp = self.mtpDraftSampling().temperature > 0.01;
+        const sharp = self.mtpDraftSampling(0).temperature > 0.01;
         return group_cost.GroupShape.samplingMode(self.mtpRerankDrafts(), false, sharp, self.sampling.temperature > 0.01);
     }
 
@@ -12357,16 +12386,17 @@ fn selectorQRow(sp: *const dflash_mod.SelectedPath, step: usize, m: u32, vocab: 
     return out;
 }
 
+/// One draft depth's token and the density it was drawn from: the `[1, V]`
+/// row the verify's accept ratio and residual read for that depth.
+const StepProposal = struct { id: mlx.mlx_array, q: mlx.mlx_array };
+
 /// Sampled draft from the exact re-scored top-32: q is the draft sampler's
 /// filtered softmax over the shortlist, the draft is drawn from that q, and q
 /// goes to the verify as a dense `[1, V]` row that is zero off the shortlist.
 /// Leviathan is exact for any q, so the residual reaches the tokens the
 /// shortlist missed; filtering inside 32 rows costs acceptance at most. The
 /// contract: the row the verify sees is the array the draft was drawn from.
-fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !struct {
-    id: mlx.mlx_array,
-    q: mlx.mlx_array,
-} {
+fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
     const shape = mlx.getShape(sl.exact);
     const n = shape[shape.len - 1];
 
@@ -12402,6 +12432,37 @@ fn shortlistProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx
     const q = try scatterShortlistQ(sl, q32, s);
     _ = mlx.mlx_array_free(q32);
     return .{ .id = id, .q = q };
+}
+
+/// An argmax depth of a chain that carries densities (consumes `amax`): the id
+/// reshaped to the `[1]` a sampled depth drafts, since the accept graphs
+/// concatenate a chain's ids, and its one-hot q.
+fn argmaxStepProposal(amax: mlx.mlx_array, vocab: c_int, s: mlx.mlx_stream) !StepProposal {
+    defer _ = mlx.mlx_array_free(amax);
+    var id = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(id);
+    try mlx.check(mlx.mlx_reshape(&id, amax, &[_]c_int{1}, 1, s));
+    return .{ .id = id, .q = try lazyOneHotRow(id, vocab, s) };
+}
+
+/// A depth of a chain that carries densities, off the rerank shortlist: a
+/// sampling depth draws from it (`shortlistProposal`), an argmax depth (the
+/// greedy tail) takes the token a greedy chain drafts.
+fn shortlistStepProposal(sl: mtp_mod.Shortlist, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
+    if (sampling.temperature > 0.01) return shortlistProposal(sl, sampling, s);
+    return argmaxStepProposal(try mtp_mod.shortlistArgmax(s, sl), sl.rows, s);
+}
+
+/// `shortlistStepProposal` off the draft head's full `[1, 1, V]` logits: q is
+/// the draft sampler's filtered softmax, the density the draft is drawn from.
+fn logitsStepProposal(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !StepProposal {
+    if (sampling.temperature <= 0.01) {
+        const shape = mlx.getShape(logits);
+        return argmaxStepProposal(sampleTokenLazy(logits, sampling, s), shape[shape.len - 1], s);
+    }
+    const q = try probsAtLastPos(logits, sampling, s);
+    errdefer _ = mlx.mlx_array_free(q);
+    return .{ .id = try sampleFromProbsLazy(q, sampling, s), .q = q };
 }
 
 /// `shortlistProposal` for K rows at once: ONE filtered block over the
@@ -13150,6 +13211,7 @@ pub fn generateMtp(
     var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
         .mtp_enabled = true,
         .mtp_acceptance = mtp_acceptance_default,
+        .mtp_greedy_tail = mtp_greedy_tail_default,
         .mtp = MtpHeadRef{ .qwen = head },
         .mtp_depth = depth,
         .lookup_prompt = lookup_prompt,
@@ -16168,6 +16230,92 @@ test "shortlistProposalRows: every row's q belongs to that row's own shortlist" 
     }
 }
 
+test "greedy tail: depth 0 hands the verify its sampled density, a later depth the one-hot at its argmax" {
+    // Bar: off the shortlist and off the full logits alike, each depth's q is the proposal its `[1]` draft came from.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const V: c_int = 4096;
+    const N: usize = 32;
+    var ids: [N]u32 = undefined;
+    var logits: [N]f32 = undefined;
+    for (0..N) |i| {
+        ids[i] = @intCast(37 + i * 101);
+        logits[i] = @as(f32, @floatFromInt(i)) * 0.25;
+    }
+    var sl = mtp_mod.Shortlist{
+        .cands = mlx.mlx_array_new_data(&ids, &[_]c_int{@intCast(N)}, 1, .uint32),
+        .exact = mlx.mlx_array_new_data(&logits, &[_]c_int{ 1, 1, @intCast(N) }, 3, .float32),
+        .rows = V,
+    };
+    defer sl.deinit();
+    const full = try allocator.alloc(f32, @intCast(V));
+    defer allocator.free(full);
+    @memset(full, -30);
+    for (ids, logits) |id, l| full[id] = l;
+    const full_logits = mlx.mlx_array_new_data(full.ptr, &[_]c_int{ 1, 1, V }, 3, .float32);
+    defer _ = mlx.mlx_array_free(full_logits);
+
+    const target = SamplingParams{ .temperature = 1.0 };
+    for (0..2) |d| {
+        const sampling = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, .per_request, true, @intCast(d)), Generator.MTP_DRAFT_TEMP);
+        for (0..2) |path| {
+            const prop = if (path == 0) try shortlistStepProposal(sl, sampling, s) else try logitsStepProposal(full_logits, sampling, s);
+            defer {
+                _ = mlx.mlx_array_free(prop.id);
+                _ = mlx.mlx_array_free(prop.q);
+            }
+            try testing.expectEqualSlices(c_int, &.{1}, mlx.getShape(prop.id));
+            const q = try proposalTestRead(allocator, prop.q, @intCast(V), s);
+            defer allocator.free(q);
+            const id_read = try proposalTestRead(allocator, prop.id, 1, s);
+            defer allocator.free(id_read);
+            const id: usize = @intFromFloat(id_read[0]);
+            var sum: f64 = 0;
+            var support: usize = 0;
+            for (q) |v| {
+                sum += v;
+                if (v > 0) support += 1;
+            }
+            try testing.expect(@abs(sum - 1.0) < 1e-4 and q[id] > 0);
+            if (d == 0) {
+                try testing.expect(support > 1);
+            } else {
+                try testing.expectEqual(@as(usize, ids[N - 1]), id);
+                try testing.expectEqual(@as(usize, 1), support);
+            }
+        }
+    }
+}
+
+test "a sampled chain whose coarse head retires mid-chain verifies: the argmax fallback drafts a [1] id" {
+    // Bar: `draftSelect`'s `[1,1]` id after a sampled `[1]` depth concatenates in both accept graphs.
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const p_data = [_]f32{ 0.5, 0.3, 0.2, 0.0, 0.1, 0.6, 0.2, 0.1, 0.0, 0.0, 0.0, 1.0 };
+    const probs = mlx.mlx_array_new_data(&p_data, &[_]c_int{ 1, 3, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs);
+    const one: i32 = 1;
+    const d0 = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(d0);
+    const q0_data = [_]f32{ 0.3, 0.5, 0.2, 0.0 };
+    const q0 = mlx.mlx_array_new_data(&q0_data, &[_]c_int{ 1, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(q0);
+    const fallback = try argmaxStepProposal(mlx.mlx_array_new_data(&one, &[_]c_int{ 1, 1 }, 2, .int32), 4, s);
+    defer {
+        _ = mlx.mlx_array_free(fallback.id);
+        _ = mlx.mlx_array_free(fallback.q);
+    }
+    for ([_]Generator.MtpGraphFn{ Generator.mtpBatchedExactGraph, Generator.mtpBatchedTypicalGraph }) |graph| {
+        var g = try graph(probs, &.{ d0, fallback.id }, &.{ q0, fallback.q }, 2, 0.2, .{}, s);
+        defer g.deinit();
+        try mlx.check(mlx.mlx_array_eval(g.accept_p));
+        const p = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
+        try testing.expectEqual(@as(f32, 0.3), p[0]);
+        try testing.expectEqual(@as(f32, 0.6), p[1]);
+    }
+}
+
 test "mtpDraftStepPath: a sampled proposal keeps the rerank shortlist" {
     // Bar: a sampled proposal reads the rerank shortlist; only the chunk-A
     // confidence gate needs the full lm_head.
@@ -16233,6 +16381,39 @@ test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
         @as(f32, 0.0),
         Generator.mtpDraftSamplingFor(cold, Generator.mtpDraftGreedyFor(cold, .sampled), 1.0).temperature,
     );
+}
+
+test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request drafts the same way with it on" {
+    const sampled = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
+    for (0..4) |d| {
+        const step: u32 = @intCast(d);
+        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, .per_request, false, step));
+        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, .per_request, true, step));
+    }
+    // Only a sampled chain's depths past 0 change: a greedy chain drafts the same sampler at every depth.
+    for ([_]f32{ 0.0, 0.005, 0.3, 1.0 }) |t| {
+        const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
+        for ([_]Generator.DraftProposal{ .greedy, .sampled, .per_request }) |mode| {
+            const greedy_chain = t <= 0.01 or Generator.mtpDraftGreedyFor(target, mode);
+            for (0..mtp_mod.MAX_DEPTH) |d| {
+                const step: u32 = @intCast(d);
+                const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, true, step), 1.0);
+                const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, false, step), 1.0);
+                try testing.expectEqual(greedy_chain or step == 0, std.meta.eql(on, off));
+            }
+        }
+    }
+}
+
+test "greedy tail: an argmax draft consumes no draw index (mtpSamplingDraw)" {
+    var g: Generator = undefined;
+    g.sampling = .{ .temperature = 1.0, .seed = 3, .draw = 5 };
+    const greedy = g.mtpSamplingDraw(.{ .temperature = 0.0, .seed = 3 });
+    try testing.expectEqual(@as(u64, 0), greedy.draw);
+    try testing.expectEqual(@as(u64, 5), g.sampling.draw);
+    const sampled = g.mtpSamplingDraw(.{ .temperature = 0.6, .seed = 3 });
+    try testing.expectEqual(@as(u64, 5), sampled.draw);
+    try testing.expectEqual(@as(u64, 6), g.sampling.draw);
 }
 
 test "filteredProbsBlock: every draft row is the SAME density the sample is drawn from" {

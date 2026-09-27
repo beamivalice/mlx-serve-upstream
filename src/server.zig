@@ -7286,6 +7286,7 @@ const PropsSettings = struct {
     mtp_loaded: bool,
     mtp_default_on: bool,
     mtp_acceptance: mtp_acceptance_mod.Mode,
+    mtp_greedy_tail: bool = false,
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
@@ -7337,6 +7338,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
+        .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -7358,18 +7360,18 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
         st.mtp_loaded,                              st.mtp_default_on,
         mtp_acceptance_mod.name(st.mtp_acceptance), param,
-        st.mtp_depth,                               st.mtp_adaptive,
-        st.max_mtp_ctx,                             st.drafter,
-        st.pld.enable,                              st.pld.draft_len,
-        st.pld.key_len,                             st.max_concurrent,
-        st.prefill_decode_share,                    st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,
+        st.mtp_greedy_tail,                         st.mtp_depth,
+        st.mtp_adaptive,                            st.max_mtp_ctx,
+        st.drafter,                                 st.pld.enable,
+        st.pld.draft_len,                           st.pld.key_len,
+        st.max_concurrent,                          st.prefill_decode_share,
+        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
     });
 }
 
@@ -20182,6 +20184,17 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
+}
+
+test "settingsPropsJson: /props names the greedy tail" {
+    for ([_]bool{ false, true }) |tail| {
+        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+        defer testing.allocator.free(frag);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+        defer parsed.deinit();
+        const got = parsed.value.object.get("mtp").?.object.get("greedy_tail") orelse return error.MissingGreedyTail;
+        try testing.expectEqual(tail, got.bool);
+    }
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {

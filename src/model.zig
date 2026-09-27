@@ -445,6 +445,8 @@ pub const ModelConfig = struct {
     mtp_override: ?bool = null,
     /// null = the process `--mtp-typical`/`--mtp-tokenv3` (exact when neither).
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
+    /// null = the process `--mtp-greedy-tail` (off when absent).
+    mtp_greedy_tail_override: ?bool = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.

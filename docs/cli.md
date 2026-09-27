@@ -64,6 +64,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
 | `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off) |
 | `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
+| `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |

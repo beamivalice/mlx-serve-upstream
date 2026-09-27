@@ -54,6 +54,19 @@ the 164-task Python HumanEval quality gate remains open. llmprobe's standard
 conformance/capability/fidelity scores are largely outside its creative-sampling
 benchmark path.
 
+## Greedy tail (`--mtp-greedy-tail`)
+
+Opt-in, off by default; a model's `mtp_greedy_tail` in model-settings.json
+outranks the flag. A sampled request draws depth 0 from the draft sampler and
+takes the head's argmax at every later depth, and the verify reads a one-hot q
+for those depths, so `exact` stays distribution-exact and `typical` judges the
+argmax against its entropy floor. It pays with `--mtp-typical` only: under exact
+acceptance an argmax draft is accepted with its target probability. Apple M5 Max,
+Vontra Flash-Next 4-bit pack, T=1.0, code and prose at 1K/4K/16K, two seeds,
+A B B A on one binary: typical 0.2 decoded 86.7 tok/s, typical 0.2 plus the tail
+99.4 tok/s (2.96 to 3.36 tokens per round). Greedy output is byte-identical with
+the tail on.
+
 ## Paired routed gate/up kernel
 
 `MLX_SERVE_MOE_VERIFY_PAIRED_GU=1` installs an opt-in physical-S=4 routed

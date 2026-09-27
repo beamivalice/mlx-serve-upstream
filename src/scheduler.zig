@@ -2704,6 +2704,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.kv_quant_override = o.kv_quant;
     config.mtp_override = o.mtp;
     config.mtp_acceptance_override = o.mtp_acceptance;
+    config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;
@@ -3753,6 +3754,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Per-model settings (stamped on the config at BOTH construction sites) outrank the flags.
     const kv_quant_config = params.config.kv_quant_override orelse params.kv_quant_config;
     const mtp_enabled = params.config.mtp_override orelse params.mtp_enabled;
+    const tail_override = params.config.mtp_greedy_tail_override;
+    if (mtp_enabled and (tail_override != null or generate_mod.mtp_greedy_tail_default)) log.info("[mtp] greedy tail {s} ({s})\n", .{
+        if (generate_mod.mtpGreedyTailFor(tail_override)) "on" else "off",
+        if (tail_override != null) "model-settings.json" else "--mtp-greedy-tail",
+    });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
@@ -6745,6 +6751,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             ),
             .mtp_enabled = use_mtp,
             .mtp_acceptance = slot.model.config.?.mtpAcceptance(generate_mod.mtp_acceptance_default),
+            .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(slot.model.config.?.mtp_greedy_tail_override),
             .mtp = if (use_mtp) slot.mtp else null,
             // The model's head before this request's opt-out (`entry.mtp` already ANDs `--no-mtp`).
             .model_has_mtp = slot.mtp != null,
