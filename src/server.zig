@@ -9770,6 +9770,14 @@ fn nonStreamingViaScheduler(
             .done => break :wait,
             .err => return slotFailure(slot),
         }
+        if (conn) |c| {
+            if (c.peerClosed()) {
+                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                slot.cancel();
+                client_gone = true;
+                break :wait;
+            }
+        }
     }
 
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
