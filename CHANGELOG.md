@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+- Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
+
 ## v26.10.1 — Speed Across the Board - GGUF on Our MLX Engine - Sushi Flash Next - Qwen-Image Editing
 
 ### Highlights

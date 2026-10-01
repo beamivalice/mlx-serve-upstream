@@ -312,7 +312,6 @@ pub const NgramTable = struct {
         const bits: u32 = std.fmt.parseInt(u32, bits_v.string, 10) catch return error.NgramTableHeader;
         const gs: u32 = std.fmt.parseInt(u32, gs_v.string, 10) catch return error.NgramTableHeader;
         if (!bitsSupported(bits)) return error.NgramTableBits;
-        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         // Raw BF16 mode: one `weight` BF16 [rows, dim] region, no
         // scales/biases. `wcols`/`scols` stay 0; only `row`'s raw arm reads it.
@@ -332,6 +331,8 @@ pub const NgramTable = struct {
                 .scols = 0,
             };
         }
+
+        if (gs == 0 or gs > 1024) return error.NgramTableBits;
 
         const w = try headerRegion(obj, "weight", "U32", 4, map.len, data_off);
         const sc = try headerRegion(obj, "scales", "BF16", 2, map.len, data_off);
@@ -500,7 +501,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -803,6 +803,28 @@ test "ngram table row dequant reads the dense mx.quantize packing at every width
         var out: [32]f32 = undefined;
         t.row(0, &out);
         for (out, 0..) |v, k| try testing.expectEqual(@as(f32, @floatFromInt(k % 4)), v);
+    }
+}
+
+test "ngram table raw BF16 rows do not depend on quantization group size" {
+    for ([_][]const u8{ "0", "1", "32", "1024" }) |group_size| {
+        var header_buf: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &header_buf,
+            "{{\"__metadata__\":{{\"format\":\"mlx-serve-ngram\",\"bits\":\"16\",\"group_size\":\"{s}\"}}," ++
+                "\"weight\":{{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[0,8]}}}}",
+            .{group_size},
+        );
+        const buf = try ngramTestImage(header, 8);
+        defer std.heap.page_allocator.free(buf);
+        const values = [_]u16{ 0x3F80, 0xC000, 0x3F00, 0x4040 };
+        for (values, 0..) |value, i| std.mem.writeInt(u16, buf[520 + i * 2 ..][0..2], value, .little);
+        const table = try NgramTable.parse(buf, buf[8..520], 520);
+        var row: [2]f32 = undefined;
+        table.row(0, &row);
+        try testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, &row);
+        table.row(1, &row);
+        try testing.expectEqualSlices(f32, &.{ 0.5, 3.0 }, &row);
     }
 }
 

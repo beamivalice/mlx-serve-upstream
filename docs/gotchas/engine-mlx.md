@@ -5380,3 +5380,13 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+
+## Raw BF16 n-gram tables have no quantization groups
+
+Sushi Flash Next packs can pair EXL3 experts with a raw BF16 n-gram table
+whose metadata uses `bits=16, group_size=0`. Checking affine group geometry
+before selecting the BF16 reader rejected these packs with `NgramTableBits`.
+Validate group size only in the quantized branch; raw BF16 rows do not use it.
+The `ngram table raw BF16 rows do not depend on quantization group size`
+test checks decoded values with zero and nonzero group metadata. Existing
+header tests still reject zero group size for quantized tables.
