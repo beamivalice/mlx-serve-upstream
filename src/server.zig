@@ -15,6 +15,7 @@ const model_mod = @import("model.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
+const mimo_vision = @import("mimo_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
@@ -5347,6 +5348,15 @@ fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 /// Reads the same kill switch the route does, so an A/B with the route off
 /// does not get billed for it.
 fn prefillDequantWeightBytes(config: *const model_mod.ModelConfig) u64 {
+    if (config.mimo_source_checkpoint) {
+        var widest: u64 = config.intermediate_size;
+        for (0..config.num_hidden_layers) |i| {
+            const li: u32 = @intCast(i);
+            widest = @max(widest, @as(u64, config.layerNumHeads(li)) * config.layerHeadDim(li) +
+                @as(u64, config.layerKVHeads(li)) * (config.layerHeadDim(li) + config.layerVHeadDim(li)));
+        }
+        return 2 * widest * config.hidden_size * 2;
+    }
     if (config.quant_bits == 0 or config.quant_mode != .affine) return 0;
     if (!transformer_mod.prefillDqGemmEnabled()) return 0;
     return 3 * prefillFfnWidth(config) * @as(u64, config.hidden_size) * 2;
@@ -5470,6 +5480,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
+            .state_bytes = if (config.isMimo() and warm.mtp_on) @import("mimo_mtp.zig").State.billedBytes(config) else 0,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
             .dq_min_rows = dq_min_rows,
         };
@@ -5487,7 +5498,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const credited = warm.creditedRows(reserved);
     return .{
         .reserved_kv_bytes = (reserved -| seq) * kv_per_tok,
-        .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok),
+        .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok) +
+            (if (config.isMimo() and mtp_on) @import("mimo_mtp.zig").State.billedBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
@@ -13625,7 +13637,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -13822,6 +13834,14 @@ fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vision
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.mimo_vision) return .{
+        .mode = .mimo,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_pixels = config.qv_min_pixels,
+        .max_pixels = config.qv_max_pixels,
+    };
     if (!config.qwen_vision and !config.muse_vision) return .{};
     return .{
         .mode = if (config.muse_vision) .muse else .qwen,
@@ -14322,6 +14342,7 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const max_pixels = bounds.max;
         if (bounds.clamped and vp.mode == .qwen) logVisionPixelClamp(vp.max_pixels);
         const rs = switch (vp.mode) {
+            .mimo => mimo_vision.smartResize(src_h, src_w, factor, min_pixels, max_pixels),
             .muse => muse_vision.smartResize(src_h, src_w, factor, if (vp.max_tokens > 0) vp.max_tokens else model_mod.MUSE_MAX_IMAGE_TOKENS),
             .lfm2 => lfm2_vision.smartResize(src_h, src_w, vp.patch, vp.merge, vp.min_tokens, vp.max_tokens),
             else => qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels),
@@ -14338,16 +14359,20 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbNormalizedChw(
-            allocator,
-            chw,
-            px[0..source_len],
-            src_h,
-            src_w,
-            rh,
-            rw,
-            resampleFilterFor(vp),
-        ) catch return null;
+        if (vp.mode == .mimo) {
+            mimo_vision.resizeNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw) catch return null;
+        } else {
+            qwen_vision.resizeRgbNormalizedChw(
+                allocator,
+                chw,
+                px[0..source_len],
+                src_h,
+                src_w,
+                rh,
+                rw,
+                resampleFilterFor(vp),
+            ) catch return null;
+        }
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @ptrCast(@alignCast(pv_bytes.ptr)))[0 .. n * feat];
