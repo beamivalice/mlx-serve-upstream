@@ -749,6 +749,10 @@ pub const ModelConfig = struct {
             (if (self.isGlobalLayer(layer_idx)) self.attn_sinks_global else self.attn_sinks_sliding);
     }
 
+    pub fn usesMimoSourceTrunk(self: *const ModelConfig) bool {
+        return self.isMimo() and self.mimo_source_checkpoint;
+    }
+
     pub fn isMimo(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
@@ -841,16 +845,15 @@ pub const ModelConfig = struct {
     /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
     /// prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
-        return self.longCtxGated();
+        return self.longCtxGated() or self.swaRingTokens() > 0;
     }
 
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
-        if (self.isMimo()) {
+        if (self.swaRingTokens() > 0) {
             var bytes: u64 = 0;
             for (0..self.num_hidden_layers) |i| {
                 const li: u32 = @intCast(i);
-                bytes += @as(u64, self.layerKVHeads(li)) *
-                    (@as(u64, self.layerHeadDim(li)) + self.layerVHeadDim(li)) * 2;
+                if (self.isGlobalLayer(li)) bytes += self.layerKvBytes(li);
             }
             return bytes;
         }
@@ -1414,6 +1417,84 @@ pub const ModelConfig = struct {
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
+    pub fn layerKvBytes(self: *const ModelConfig, li: u32) u64 {
+        return @as(u64, self.layerKVHeads(li)) *
+            (@as(u64, self.layerHeadDim(li)) + @as(u64, self.layerVHeadDim(li))) * 2;
+    }
+
+    pub const SWA_RING_SLACK: u64 = 512;
+    pub const SWA_RING_CHECKPOINT_BACKOFF: u64 = 30;
+    pub fn swaRingTokens(self: *const ModelConfig) u64 {
+        if (!std.mem.eql(u8, self.model_type, "mimo_v2")) return 0;
+        if (!self.has_sliding_window or self.sliding_window == 0) return 0;
+        if (self.head_dim == 256) return 0;
+        return @as(u64, self.sliding_window) + SWA_RING_SLACK;
+    }
+
+    pub fn swaRingBytes(self: *const ModelConfig) u64 {
+        const rows = self.swaRingTokens();
+        if (rows == 0) return 0;
+        return rows * self.slidingLayerKvBytesPerToken(self.num_hidden_layers);
+    }
+
+    pub fn swaRingCheckpointTokens(self: *const ModelConfig) u64 {
+        if (self.swaRingTokens() == 0) return 0;
+        return @as(u64, self.sliding_window) + SWA_RING_CHECKPOINT_BACKOFF;
+    }
+
+    pub fn swaRingCheckpointBytes(self: *const ModelConfig) u64 {
+        return self.swaRingCheckpointTokens() * self.slidingLayerKvBytesPerToken(self.num_hidden_layers);
+    }
+
+    pub fn swaStreamBytesPerToken(self: *const ModelConfig, max_layers: u64) u64 {
+        if (self.swaRingTokens() == 0) return 0;
+        return self.slidingLayerKvBytesPerToken(max_layers);
+    }
+
+    fn slidingLayerKvBytesPerToken(self: *const ModelConfig, max_layers: u64) u64 {
+        var total: u64 = 0;
+        var seen: u64 = 0;
+        var li: u32 = 0;
+        while (li < self.num_hidden_layers and seen < max_layers) : (li += 1) {
+            if (self.isGlobalLayer(li)) continue;
+            total += self.layerKvBytes(li);
+            seen += 1;
+        }
+        return total;
+    }
+
+    pub fn isKvPerTokenLayer(self: *const ModelConfig, li: u32) bool {
+        if (self.swaRingTokens() > 0) return self.isGlobalLayer(li);
+        return !self.isLinearLayer(li);
+    }
+
+    pub fn reservesKvCapacity(self: *const ModelConfig) bool {
+        return self.longCtxGated() or self.swaRingTokens() > 0;
+    }
+
+    pub fn supportsBatchedMimoDecode(self: *const ModelConfig) bool {
+        return self.isMimo();
+    }
+
+    pub fn effectiveKvQuant(self: *const ModelConfig, launch: kv_quant_mod.KVQuantConfig) kv_quant_mod.KVQuantConfig {
+        return self.kv_quant_override orelse if (self.isMimo() and !kv_quant_mod.launch_explicit and launch.scheme == .off)
+            kv_quant_mod.KVQuantConfig.engine_default else launch;
+    }
+
+    pub fn admissionEvictsHotCache(self: *const ModelConfig) bool {
+        return self.longCtxGated() or self.isMimo();
+    }
+
+    pub fn kvPerTokenLayerCount(self: *const ModelConfig) u32 {
+        if (self.swaRingTokens() == 0) return self.attnCacheLayerCount();
+        var n: u32 = 0;
+        var li: u32 = 0;
+        while (li < self.num_hidden_layers) : (li += 1) {
+            if (self.isGlobalLayer(li)) n += 1;
+        }
+        return n;
+    }
+
 };
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
@@ -8180,7 +8261,8 @@ test "mimo MOPD selects native resident quantization and asymmetric per-layer KV
         try testing.expectEqual(!c.isGlobalLayer(li), c.layerHasAttnSinks(li));
     }
     try testing.expectEqual(@as(usize, 9), global);
-    try testing.expectEqual(@as(u64, 222720), c.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 23040), c.kvBytesPerToken());
+    try testing.expectEqual(@as(u64, 127795200), c.swaRingBytes());
     try testing.expect(c.has_vision and c.mimo_vision);
     try testing.expectEqual(@as(u32, 0), c.audio_token_id);
     try testing.expectEqual(@as(u32, 0), c.video_token_id);

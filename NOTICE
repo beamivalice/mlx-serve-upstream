@@ -571,3 +571,10 @@ and routing math, vision tower, MTP heads, and reference-fixture tests derive
 from Sushi commit 3e700850. Adapted to mlx-serve's loading, cache, generation,
 and model lifecycle interfaces; a resident MXFP4 bank loader replaces Sushi's
 original-checkpoint expert streaming adapter. No expert codec was ported.
+
+The MiMo KV port also incorporates Sushi's bounded sliding cache, ring
+checkpoints, prefix and SSD persistence, packed KV attention, QKV preparation,
+and memory-accounting code. The asymmetric prefill shaders in
+`src/kernels/attn_pd_nax*.metal` retain the MLX/MTPLX-derived attention machinery
+covered by the upstream notices above. Adaptations preserve mlx-serve's media
+interfaces, layout fingerprints, and non-MiMo batching interfaces.

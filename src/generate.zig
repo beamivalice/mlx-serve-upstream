@@ -1237,7 +1237,7 @@ pub fn reservedPrefillTokens(
     max_tokens: u64,
     chunk: u64,
 ) u64 {
-    if (!config.longCtxGated()) return 0;
+    if (!config.reservesKvCapacity()) return 0;
     return transformer_mod.KVCache.reservedTokens(
         seq,
         max_tokens,
@@ -1338,7 +1338,7 @@ pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool
 /// on top of it (8.1 GB parked at the first tick of a 393k prefill). Gated on
 /// `longCtxGated`: every other arch keeps its previous call pattern exactly.
 pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
-    return config.longCtxGated();
+    return config.reservesKvCapacity();
 }
 
 /// Number of accepted draft tokens that may accompany the always-committed
@@ -2757,13 +2757,8 @@ pub const Generator = struct {
             const cp_thin: transformer_mod.ThinPolicy =
                 if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
 
-            const reserved_tokens = reservedPrefillTokens(
-                &xfm.config,
-                total_ctx_for_chunk,
-                max_tokens,
-                default_chunk,
-            );
-            ctx.cache.reserve(@intCast(reserved_tokens));
+            const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config,
+                total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
             if (mtp_cache) |*mc| mc.activate();
             transformer_mod.reserveQsaHistoryWithHead(
@@ -4238,7 +4233,7 @@ pub const Generator = struct {
         const t1: u32 = self.next_token_id;
 
         // Cap draft_len so the verify forward stays a small fixed cost.
-        const max_draft: u32 = @min(draft_len, 15);
+        const max_draft: u32 = @min(draft_len, if (xfm.config.isMimo()) @as(u32, transformer_mod.MIMO_VERIFY_ROWS_MAX - 1) else 15);
         const klen: u32 = @max(@as(u32, 1), key_len);
 
         // ── Phase 1: Lookup ──
@@ -4333,8 +4328,9 @@ pub const Generator = struct {
         // `if (layer == 0)` — so it stays stale (~0) for this family. The
         // full-attention KV entries instead track `moe_seq_offset` (both advance
         // by seq_len per forward), so that is the real KV length to roll back to.
-        var kv_snap = try self.ctx.cache.snapshot();
-        defer kv_snap.deinit();
+        const is_mimo = xfm.config.isMimo();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (is_mimo) null else try self.ctx.cache.snapshot();
+        defer if (kv_snap) |*snapshot| snapshot.deinit();
         var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
         defer if (ssm_snaps) |snaps| {
             for (snaps) |*sn| ssmSnapshotDeinit(sn);
@@ -4368,6 +4364,8 @@ pub const Generator = struct {
         // only GatedDeltaNet layers actually populate `spec_state_seq`, so
         // pure-attention / Mamba2 / LFM2 fall through to the snapshot fallback.
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
+        self.ctx.verify_rows = is_mimo;
+        defer self.ctx.verify_rows = false;
         var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
         errdefer _ = mlx.mlx_array_free(verify_logits);
         self.ctx.capture_ssm_seq = false;
@@ -4500,20 +4498,23 @@ pub const Generator = struct {
             else
                 false;
 
-            if (gdn_captured) {
+            if (is_mimo) {
+                try self.ctx.cache.truncate(moe_seq_offset_snap + 1 + @as(usize, accepted), s);
+                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + 1 + @as(usize, accepted);
+            } else if (gdn_captured) {
                 const accepted_len: usize = 1 + @as(usize, accepted);
                 // `truncate` overwrites cache.step with its length arg; on this
                 // family cache.step is a stale counter the model never reads
                 // (positioning is moe_seq_offset), so preserve the snapshot's
                 // value to keep the prefix cache's kv_step bookkeeping identical
                 // to the restore-based fallback.
-                const step_keep = kv_snap.step;
+                const step_keep = kv_snap.?.step;
                 try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
                 self.ctx.cache.step = step_keep;
                 try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
                 self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
             } else {
-                try self.ctx.cache.restore(&kv_snap);
+                try self.ctx.cache.restore(&kv_snap.?);
                 if (ssm_snaps) |snaps| {
                     for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
                 }
@@ -8186,7 +8187,7 @@ pub const Generator = struct {
         // snapshot is taken at all. A hypothetical pure-attention target
         // (ssm_entries == null) keeps the proven snapshot + re-forward path.
         const kv_step_snap = self.ctx.cache.step;
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null) null else try self.ctx.cache.snapshot();
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null or self.xfm.config.isMimo()) null else try self.ctx.cache.snapshot();
         errdefer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
@@ -8267,6 +8268,8 @@ pub const Generator = struct {
         self.ctx.ple_defer = true;
         self.ctx.pipeline_build = if (self.mtp_serial_accept) VERIFY_PIPELINE_LAYERS else 0;
         defer self.ctx.pipeline_build = 0;
+        self.ctx.verify_rows = xfm.config.isMimo();
+        defer self.ctx.verify_rows = false;
         const verify_logits = xfm.forwardWithCaptureAll(&self.ctx, st.verify_input, &new_hidden, &verify_hidden_all) catch |e| {
             self.ctx.ple_defer = false;
             self.ctx.capture_ssm_seq = false;
@@ -9026,7 +9029,17 @@ pub const Generator = struct {
 
         var re_new_hidden = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(re_new_hidden);
-        if (gdn_captured) {
+        if (xfm.config.isMimo()) {
+            const accepted_len: usize = 1 + @as(usize, accepted);
+            try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
+            self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
+
+            const vh_shape = mlx.getShape(verify_hidden_all);
+            const start = [_]c_int{ 0, @intCast(accepted), 0 };
+            const stop = [_]c_int{ 1, @as(c_int, @intCast(accepted)) + 1, vh_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&re_new_hidden, verify_hidden_all, &start, 3, &stop, 3, &strides, 3, s));
+        } else if (gdn_captured) {
             const accepted_len: usize = 1 + @as(usize, accepted);
             // `truncate` overwrites cache.step with its length arg; on this
             // family cache.step is a stale counter the model never reads
@@ -21856,4 +21869,11 @@ test "keyed sampling draws the softmax distribution" {
         counts[@intCast(v)] += 1;
     }
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
+}
+
+pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, s: mlx.mlx_stream) !u64 {
+    const reserved = reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
+    cache.reserve(@intCast(reserved));
+    try cache.growToReservation(s);
+    return reserved;
 }

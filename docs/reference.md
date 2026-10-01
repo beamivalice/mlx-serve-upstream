@@ -620,11 +620,23 @@ experts can also be stacked by the loader.
 
 The 48 layers have nine global and 39 sliding attention layers, K/V widths
 192/128, four/eight KV heads, a 128-token window, partial RoPE, and sliding
-sinks. This WIP uses mlx-serve's existing KV storage and SDPA: it has not yet
-ported Sushi's bounded sliding rings or packed long-context attention kernels.
-The KV bill therefore includes every layer at its actual K/V geometry.
-Full-checkpoint output quality, MTP equivalence, image quality, peak load
-memory, and throughput remain to be checked on the maintainer's 256 GB Mac.
+sinks. The KV path includes Sushi's bounded sliding rings (absolute `base +
+offset` positions), quantized views, global-layer capacity reservation, packed
+prefill slices, fused band/sink prefill, M5 matmul2d and SIMD split-K decode,
+and row-exact speculative attention. MiMo defaults to KV8; `--kv-quant off`
+and per-model/request settings can select another scheme.
+
+Prefix reuse retains prompt-end, fork and message-boundary ring checkpoints.
+The SSD tier persists global chunks plus ring files in manifest format v9;
+restore, trimming, checkout, rollback and memory bills carry those windows.
+MiMo's ordinary decode can batch up to four independent slots; speculative
+rounds retain per-slot state. The reservation and admission paths bill only
+global layers per token, plus bounded rings, checkpoint copies and scratch.
+
+This expanded WIP has not been validated end to end. Full-checkpoint output
+quality, MTP equivalence, image quality, load peak, cache restore, and throughput
+remain for the maintainer's 256 GB Mac. The earlier limited port's test results
+do not validate these cache changes.
 
 Header-only inspection of the supplied checkpoint measured 158.10 GiB for
 text plus experts, before caches and scratch; vision adds 1.36 GiB and MTP
@@ -664,3 +676,14 @@ with `.zig-toolchain/zig build test`; no real model is required.
 `python tests/test_mimo_resident.py /tmp/mimo-ref` checks HTTP generation,
 forced three-head MTP equivalence, warm-cache reuse, and unload/reload on that
 tiny model; add `--kv-quant 8` to exercise the quantized cache.
+
+The real-model ring scenarios are included for later bring-up (not run here):
+
+```sh
+MIMO_MODEL=/absolute/path/MiMo-V2.6-Flash-MOPD bash tests/test_mimo_ring_reuse.sh
+MIMO_MODEL=/absolute/path/MiMo-V2.6-Flash-MOPD bash tests/test_mimo_ring_fork_ssd.sh
+```
+
+`MLX_SERVE_KV_CACHE_DIR` overrides the SSD cache directory, allowing the restart
+scenario to use its own temporary directory. The default remains
+`~/.mlx-serve/kv-cache`.

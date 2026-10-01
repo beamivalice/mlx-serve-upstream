@@ -54,7 +54,7 @@ def main():
             proc = subprocess.Popen([str(args.bin.resolve()), "--model", str(model), "--serve",
                                      "--host", "127.0.0.1", "--port", str(port), "--ctx-size", "1024",
                                      "--no-vision", "--no-drafter", "--log-level", "debug"] +
-                                    (["--kv-quant", "8"] if args.kv_quant else []),
+                                    (["--kv-quant", "8"] if args.kv_quant else ["--kv-quant", "off"]),
                                     env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 60
