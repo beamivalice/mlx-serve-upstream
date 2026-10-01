@@ -501,6 +501,7 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
+
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
