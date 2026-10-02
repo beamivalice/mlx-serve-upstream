@@ -4863,23 +4863,22 @@ unmeasured.
 
 ## PLE prefill must measure table reads, not infer residency from context length
 
-The 262144-token pool threshold assumed short prompts used a resident n-gram
-mapping. A cold 29.8 GiB Sushi table reproduced 191–344 prompt tok/s and
-1.6–3.0 s TTFT even after model startup completed. Parallel reads of the same
-bytes restored 825–1229 prompt tok/s. Resident mappings can favor serial reads,
-so forcing the pool everywhere loses that benefit.
+Short KV does not guarantee a resident n-gram mapping. A cold 29.8 GiB table
+reproduced 1.6–3.0 s TTFT after startup; parallel reads restored throughput.
+Resident tables can favor serial reads (the earlier sweep found a 2–7% pool penalty).
 
-`NgramTable.calibrateArm` samples 128 rows per arm before background warming,
-with disjoint row sets and a 20% margin. Warming completion publishes an atomic
-refresh request; the next automatic wide gather measures fresh rows on the
-inference thread. The warmer never borrows the shared reader pool or mutates
-its policy. A resident table can return to serial; completion alone does not
-force serial on a table that cannot stay resident. The KV threshold still
-handles later eviction at long context.
-`QWEN4_PLE_PREFETCH_PREFILL=0|1` still forces either arm and skips calibration.
-BF16 and GPU table gathers retain their existing paths. The `ngram prefill`
-tests pin the margin, overrides, disjoint samples, actual pool engagement and
-bit-identical gathered values. Adapted from Sushi's measured gather selection.
+`NgramTable.calibrateArm` samples 128 disjoint rows per arm with a 20% margin.
+Warming completion publishes an atomic refresh request; the next automatic wide
+gather measures fresh rows on the inference thread. The warmer never borrows
+the reader pool or mutates its policy. Completion alone does not force serial
+on a table that cannot stay resident. The KV gate still handles long contexts.
+With `MLX_SERVE_NGRAM_WARM=0`, only the load-time calibration runs: demand reads
+do not re-arm it. A cold-load pool choice therefore persists even if demand
+reads later warm the table. Reload to remeasure, or explicitly force the read arm.
+`QWEN4_PLE_PREFETCH_PREFILL=0|1` forces serial/pool and skips calibration.
+BF16 and GPU gathers retain their existing paths. The `ngram prefill` tests pin
+the margin, overrides, warm refresh, pool engagement and identical gathered rows.
+Adapted from Sushi's measured gather selection.
 
 ## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
 
