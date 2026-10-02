@@ -4861,14 +4861,21 @@ reads the first attention layer's own offset. Gated: the 27B's batched
 +12%/+8% were measured with the cap dead, and un-batching those streams is
 unmeasured.
 
-## The PLE prefill prefetch is a kv gate, not a flag (PR #363)
+## PLE prefill must measure table reads, not infer residency from context length
 
-The pool served decode widths only. On the 374k ladder the serial gather went
-67.7 -> 267.9 ms per 1000 prompt tokens as the weights evicted the 32 GB
-mapping (31% of the prefill slowdown); on a resident table the pool LOSES
-2-7% at every rung to 256k. `PREFILL_PREFETCH_MIN_KV` 262144 sits at the top
-of the measured-cost range; `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces an arm,
-and both arms announce which one ran.
+The 262144-token pool threshold assumed short prompts used a resident n-gram
+mapping. A cold 29.8 GiB Sushi table reproduced 191–344 prompt tok/s and
+1.6–3.0 s TTFT even after model startup completed. Parallel reads of the same
+bytes restored 825–1229 prompt tok/s. Resident mappings can favor serial reads,
+so forcing the pool everywhere loses that benefit.
+
+`NgramTable.calibrateArm` samples 128 rows per arm before background warming,
+with disjoint row sets and a 20% margin. A measured pool win engages below the
+KV threshold; the threshold still handles later eviction at long context.
+`QWEN4_PLE_PREFETCH_PREFILL=0|1` still forces either arm and skips calibration.
+BF16 and GPU table gathers retain their existing paths. The `ngram prefill`
+tests pin the margin, overrides, disjoint samples, actual pool engagement and
+bit-identical gathered values. Adapted from Sushi's measured gather selection.
 
 ## A contaminated round-cost cell that no trial could ever re-measure (2026-09-07)
 

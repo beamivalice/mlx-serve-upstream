@@ -12,6 +12,7 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
@@ -202,6 +203,9 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
+    /// Measured before background warming; a cold table can need the pool even at short KV.
+    prefer_pool: bool = false,
+    calib: Calibration = .{},
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -374,6 +378,59 @@ pub const NgramTable = struct {
         if (!self.gpu_owns_map) std.posix.munmap(self.map);
     }
 
+    /// Sample the real mapping before background warming, using disjoint row sets so
+    /// the serial arm does not warm the pool's input. Explicit overrides skip calibration.
+    pub fn calibrateArm(self: *NgramTable) void {
+        if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
+        const p = self.pool orelse return;
+        if (self.fd < 0 or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
+        if (self.wcols * 4 + self.scols * 4 > PrefetchPool.ROW_BUF) return;
+
+        var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        calibrationRows(self.rows, &serial_rows, &pool_rows);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var sw = io_util.Stopwatch.init(io);
+        var acc: u64 = 0;
+        for (serial_rows) |r| acc +%= self.touchRow(@intCast(r));
+        const serial_ns = sw.read();
+        std.mem.doNotOptimizeAway(acc);
+
+        sw.reset();
+        var start: usize = 0;
+        while (start < pool_rows.len) : (start += PrefetchPool.MAX_ROWS) {
+            const end = @min(start + PrefetchPool.MAX_ROWS, pool_rows.len);
+            if (!p.run(self, pool_rows[start..end])) return;
+        }
+        const pool_ns = sw.read();
+        self.calib = .{ .serial_ns = serial_ns, .pool_ns = pool_ns };
+        self.prefer_pool = plePrefillPrefetchArm(serial_ns, pool_ns);
+        log.info("[qwen4] ngram gather calibration: {s} ({d} rows per arm: serial {d:.2} ms, pool {d:.2} ms)\n", .{
+            if (self.prefer_pool) "POOLED" else "SERIAL",
+            PLE_CALIBRATION_ROWS,
+            @as(f64, @floatFromInt(serial_ns)) / 1e6,
+            @as(f64, @floatFromInt(pool_ns)) / 1e6,
+        });
+    }
+
+    /// Touch every page read by a quantized row, without the common dequantization work.
+    fn touchRow(self: *const NgramTable, r: u64) u64 {
+        const wl: usize = self.wcols * 4;
+        const sl: usize = self.scols * 2;
+        const regions = [_][]const u8{
+            self.map[self.w_off + r * wl ..][0..wl],
+            self.map[self.s_off + r * sl ..][0..sl],
+            self.map[self.b_off + r * sl ..][0..sl],
+        };
+        var acc: u64 = 0;
+        for (regions) |region| {
+            var i: usize = 0;
+            while (i < region.len) : (i += std.heap.page_size_min) acc +%= region[i];
+            if (region.len > 0) acc +%= region[region.len - 1];
+        }
+        return acc;
+    }
+
     const WARM_CHUNK: usize = 8 << 20;
 
     /// Read the whole table through the fd once, in the background, so the
@@ -465,14 +522,12 @@ pub const NgramTable = struct {
             return;
         }
         const need: usize = self.wcols * 4 + self.scols * 4;
-        // Prefill-width gathers ride the pool only past `PREFILL_PREFETCH_MIN_KV`: a resident
-        // table loses 2-7% to the wake rounds, an evicted one (weights pushed the 32 GB
-        // mapping out) went 67.7 -> 267.9 ms per 1000 tokens on the serial walk.
+        // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len);
+        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, self.prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len);
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, self.prefer_pool);
         if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
@@ -501,7 +556,6 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -615,16 +669,17 @@ pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
 pub var ple_prefill_arm_said: [2][2]std.atomic.Value(bool) =
     .{ .{ .init(false), .init(false) }, .{ .init(false), .init(false) } };
 
-fn notePrefillGatherArm(pooled: bool, rows: usize) void {
+fn notePrefillGatherArm(pooled: bool, rows: usize, prefer_pool: bool) void {
     const arm: usize = if (pooled) 1 else 0;
     const bucket: usize = if (rows >= PREFILL_SAY_MIN_ROWS) 1 else 0;
     if (ple_prefill_arm_said[arm][bucket].swap(true, .monotonic)) return;
     const width: []const u8 = if (bucket == 1) "prefill width" else "warmup width";
+    const why: []const u8 = if (plePrefillPrefetchMode() != .kv_gated) "QWEN4_PLE_PREFETCH_PREFILL override" else if (prefer_pool) "pool measured faster" else "KV gate";
     if (pooled) {
         const batches = (rows + PrefetchPool.MAX_ROWS - 1) / PrefetchPool.MAX_ROWS;
-        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; past kv {d}, QWEN4_PLE_PREFETCH_PREFILL=0 forces the serial walk)\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: POOLED ({s}: {d} rows, {d} batches of {d}; {s})\n", .{ width, rows, batches, PrefetchPool.MAX_ROWS, why });
     } else {
-        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; the pool engages past kv {d}, QWEN4_PLE_PREFETCH_PREFILL_MIN_KV overrides)\n", .{ width, rows, plePrefillPrefetchMinKv() });
+        log.info("[qwen4] PLE prefill gather: SERIAL mmap walk ({s}: {d} rows; {s}, threshold {d})\n", .{ width, rows, why, plePrefillPrefetchMinKv() });
     }
 }
 
@@ -632,14 +687,12 @@ fn notePrefillGatherArm(pooled: bool, rows: usize) void {
 pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
-/// The kv length past which a wide prefill gather takes the pool: the top of the measured
-/// cost range (the pool loses at every rung to 256k on a resident table; the only win is the
-/// evicted table on the 374k ladder). `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides.
+/// Long KV can evict a table that was resident at load. This gate supplements calibration.
 pub const PREFILL_PREFETCH_MIN_KV: u64 = 262144;
 
 pub const PrefillPrefetchMode = enum { off, kv_gated, on };
 
-/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = the kv gate, `0` = serial walk, `1` = pool.
+/// `QWEN4_PLE_PREFETCH_PREFILL`: absent = calibration + KV gate, `0` = serial, `1` = pool.
 pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
     const r = raw orelse return .kv_gated;
     if (r.len == 0) return .kv_gated;
@@ -656,11 +709,33 @@ pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
     return std.fmt.parseInt(u64, t, 10) catch PREFILL_PREFETCH_MIN_KV;
 }
 
-pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64) bool {
+const PLE_CALIBRATION_ROWS = 128;
+const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0 };
+
+fn calibrationRows(rows: u64, serial_rows: []i64, pool_rows: []i64) void {
+    const half = rows / 2;
+    var seed: u64 = SPLITMIX_GAMMA;
+    for (serial_rows) |*r| {
+        r.* = @intCast(splitmix64(seed) % half);
+        seed +%= SPLITMIX_GAMMA;
+    }
+    for (pool_rows) |*r| {
+        r.* = @intCast(half + splitmix64(seed) % (rows - half));
+        seed +%= SPLITMIX_GAMMA;
+    }
+}
+
+/// Require a win greater than 20%; ties, noise and unreadable timers retain serial.
+pub fn plePrefillPrefetchArm(serial_ns: u64, pool_ns: u64) bool {
+    if (serial_ns == 0 or pool_ns == 0) return false;
+    return @as(u128, pool_ns) * 100 < @as(u128, serial_ns) * 80;
+}
+
+pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: u64, prefer_pool: bool) bool {
     return switch (mode) {
         .off => false,
         .on => true,
-        .kv_gated => kv_len >= min_kv,
+        .kv_gated => prefer_pool or kv_len >= min_kv,
     };
 }
 
@@ -676,8 +751,8 @@ fn plePrefillPrefetchMinKv() u64 {
     return v;
 }
 
-fn plePrefillPrefetchEnabled(kv_len: u64) bool {
-    if (ple_prefill_prefetch_override) |v| return v;
+fn plePrefillPrefetchMode() PrefillPrefetchMode {
+    if (ple_prefill_prefetch_override) |v| return if (v) .on else .off;
     const S = struct {
         var v: ?PrefillPrefetchMode = null;
     };
@@ -687,7 +762,11 @@ fn plePrefillPrefetchEnabled(kv_len: u64) bool {
         S.v = m;
         break :blk m;
     };
-    return plePrefillPrefetchWanted(mode, kv_len, plePrefillPrefetchMinKv());
+    return mode;
+}
+
+fn plePrefillPrefetchEnabled(kv_len: u64, prefer_pool: bool) bool {
+    return plePrefillPrefetchWanted(plePrefillPrefetchMode(), kv_len, plePrefillPrefetchMinKv(), prefer_pool);
 }
 
 pub fn bf16ToF32(u: u16) f32 {
@@ -764,6 +843,7 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     @memcpy(aligned, &buf);
     const t = try NgramTable.parse(aligned, aligned[8..520], 520);
     try testing.expectEqual(@as(u32, 32), t.dim);
+
     var out: [32]f32 = undefined;
     t.row(0, &out);
     try testing.expectEqual(@as(f32, 1.0), out[0]);
@@ -872,16 +952,16 @@ pub const Qwen4State = struct {
 
 test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools" {
     const min = PREFILL_PREFETCH_MIN_KV;
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 0, min, false));
     for ([_]u64{ 4096, 8192, 16_384, 65_536, 131_072, 262_143 }) |kv| {
-        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min));
+        try testing.expect(!plePrefillPrefetchWanted(.kv_gated, kv, min, false));
     }
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min));
-    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096));
-    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072));
-    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min));
-    try testing.expect(plePrefillPrefetchWanted(.on, 0, min));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, min, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 355_000, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 8192, 4096, false));
+    try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072, false));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min, false));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, min, false));
 
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(null));
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
@@ -893,6 +973,28 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv("64k"));
     try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(""));
     try testing.expectEqual(@as(u64, 0), plePrefillPrefetchMinKvFromEnv("0")); // an explicit always-on
+}
+
+test "ngram prefill calibration: margin, invalid timers and explicit overrides" {
+    try testing.expect(plePrefillPrefetchArm(1000, 799));
+    for ([_]u64{ 0, 800, 900, 1000, 2000 }) |pool_ns| {
+        try testing.expect(!plePrefillPrefetchArm(1000, pool_ns));
+    }
+    try testing.expect(!plePrefillPrefetchArm(0, 1000));
+    try testing.expect(!plePrefillPrefetchArm(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try testing.expect(plePrefillPrefetchWanted(.kv_gated, 0, PREFILL_PREFETCH_MIN_KV, true));
+    try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, 0, true));
+    try testing.expect(plePrefillPrefetchWanted(.on, 0, PREFILL_PREFETCH_MIN_KV, false));
+}
+
+test "ngram prefill calibration: sampled rows are bounded and disjoint" {
+    for ([_]u64{ 256, 257, 320_000_000 }) |rows| {
+        var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
+        calibrationRows(rows, &serial_rows, &pool_rows);
+        for (serial_rows) |r| try testing.expect(r >= 0 and r < rows / 2);
+        for (pool_rows) |r| try testing.expect(r >= rows / 2 and r < rows);
+    }
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {
@@ -928,6 +1030,13 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     const pool = t.pool orelse return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 32), t.dim);
 
+    // Calibration exercises the actual mmap and pool, then leaves row values unchanged.
+    t.calibrateArm();
+    try testing.expectEqual(@as(u64, PLE_CALIBRATION_ROWS / PrefetchPool.MAX_ROWS), pool.runs.load(.monotonic));
+    try testing.expect(t.calib.serial_ns > 0 and t.calib.pool_ns > 0);
+    try testing.expectEqual(plePrefillPrefetchArm(t.calib.serial_ns, t.calib.pool_ns), t.prefer_pool);
+    t.prefer_pool = false;
+
     const ids = try testing.allocator.alloc(i64, ROWS);
     defer testing.allocator.free(ids);
     for (ids, 0..) |*r, i| r.* = @intCast((i *% 1237) % ROWS);
@@ -962,6 +1071,13 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expect(said(1, 1));
     try testing.expect(!said(1, 0));
 
+    try testing.expectEqualSlices(f32, ref, got);
+
+    // A measured pool win must engage below the KV gate without changing any row.
+    t.prefer_pool = true;
+    const calibrated_before = pool.runs.load(.monotonic);
+    t.gather(ids, got, 8192);
+    try testing.expectEqual(calibrated_before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
     try testing.expectEqualSlices(f32, ref, got);
 
     ple_prefill_prefetch_override = false;
