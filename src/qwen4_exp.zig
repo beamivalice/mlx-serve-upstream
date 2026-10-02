@@ -203,9 +203,6 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
-    /// Measured before background warming; a cold table can need the pool even at short KV.
-    prefer_pool: bool = false,
-    calib: Calibration = .{},
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -378,9 +375,19 @@ pub const NgramTable = struct {
         if (!self.gpu_owns_map) std.posix.munmap(self.map);
     }
 
-    /// Sample the real mapping before background warming, using disjoint row sets so
-    /// the serial arm does not warm the pool's input. Explicit overrides skip calibration.
-    pub fn calibrateArm(self: *NgramTable) void {
+    /// Sample before background warming; explicit read-path overrides skip calibration.
+    pub fn calibrateArm(self: *const NgramTable) void {
+        self.calibrate(.load);
+    }
+
+    /// Only the inference thread may use the reader pool or update its measured policy.
+    fn refreshAfterWarm(self: *const NgramTable) void {
+        const p = self.pool orelse return;
+        if (plePrefillPrefetchMode() == .kv_gated and p.warm_finished.swap(false, .acq_rel))
+            self.calibrate(.warmed);
+    }
+
+    fn calibrate(self: *const NgramTable, phase: CalibrationPhase) void {
         if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
         const p = self.pool orelse return;
         if (self.fd < 0 or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
@@ -388,7 +395,7 @@ pub const NgramTable = struct {
 
         var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
         var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
-        calibrationRows(self.rows, &serial_rows, &pool_rows);
+        calibrationRows(self.rows, &serial_rows, &pool_rows, phase);
         const io = std.Io.Threaded.global_single_threaded.io();
         var sw = io_util.Stopwatch.init(io);
         var acc: u64 = 0;
@@ -403,10 +410,11 @@ pub const NgramTable = struct {
             if (!p.run(self, pool_rows[start..end])) return;
         }
         const pool_ns = sw.read();
-        self.calib = .{ .serial_ns = serial_ns, .pool_ns = pool_ns };
-        self.prefer_pool = plePrefillPrefetchArm(serial_ns, pool_ns);
-        log.info("[qwen4] ngram gather calibration: {s} ({d} rows per arm: serial {d:.2} ms, pool {d:.2} ms)\n", .{
-            if (self.prefer_pool) "POOLED" else "SERIAL",
+        if (serial_ns == 0 or pool_ns == 0) return;
+        p.recordCalibration(.{ .serial_ns = serial_ns, .pool_ns = pool_ns, .phase = phase });
+        log.info("[qwen4] ngram gather calibration ({s}): {s} ({d} rows per arm: serial {d:.2} ms, pool {d:.2} ms)\n", .{
+            @tagName(phase),
+            if (p.prefer_pool) "POOLED" else "SERIAL",
             PLE_CALIBRATION_ROWS,
             @as(f64, @floatFromInt(serial_ns)) / 1e6,
             @as(f64, @floatFromInt(pool_ns)) / 1e6,
@@ -471,6 +479,9 @@ pub const NgramTable = struct {
             const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
             if (prog.should(off, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(off), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
         }
+        // Completion does not imply residency when the table exceeds available RAM.
+        // Publish a request; recalibration must not race the inference thread's pool use.
+        if (self.pool) |p| p.warm_finished.store(true, .release);
         const secs: f64 = @as(f64, @floatFromInt(t0.untilNow(wio, .boot).nanoseconds)) / 1e9;
         log.info("[qwen4] ngram table warm: done, {d:.1} GB in {d:.1} s (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{ asGb(total), secs });
     }
@@ -524,10 +535,12 @@ pub const NgramTable = struct {
         const need: usize = self.wcols * 4 + self.scols * 4;
         // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
-        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, self.prefer_pool);
+        if (wide) self.refreshAfterWarm();
+        const prefer_pool = if (self.pool) |p| p.prefer_pool else false;
+        const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
         const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
-        if (wide) notePrefillGatherArm(pooled, row_ids.len, self.prefer_pool);
+        if (wide) notePrefillGatherArm(pooled, row_ids.len, prefer_pool);
         if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
@@ -556,6 +569,7 @@ pub const NgramTable = struct {
         };
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
+
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -568,6 +582,10 @@ const PrefetchPool = struct {
     const N = 48;
     const MAX_ROWS = 64;
     const ROW_BUF = 512;
+    /// The warmer only publishes this flag; measured state belongs to the inference thread.
+    warm_finished: std.atomic.Value(bool) = .init(false),
+    prefer_pool: bool = false,
+    calib: Calibration = .{},
     mu: std.Io.Mutex = .init,
     cv: std.Io.Condition = .init,
     gen: u64 = 0,
@@ -580,6 +598,11 @@ const PrefetchPool = struct {
     /// Fan-out rounds issued; the engagement counter the prefill test reads.
     runs: std.atomic.Value(u64) = .init(0),
     threads: [N]std.Thread = undefined,
+
+    fn recordCalibration(self: *PrefetchPool, result: Calibration) void {
+        self.calib = result;
+        self.prefer_pool = plePrefillPrefetchArm(result.serial_ns, result.pool_ns);
+    }
 
     fn create() !*PrefetchPool {
         const a = std.heap.page_allocator;
@@ -710,11 +733,12 @@ pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
 }
 
 const PLE_CALIBRATION_ROWS = 128;
-const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0 };
+const CalibrationPhase = enum { load, warmed };
+const Calibration = struct { serial_ns: u64 = 0, pool_ns: u64 = 0, phase: CalibrationPhase = .load };
 
-fn calibrationRows(rows: u64, serial_rows: []i64, pool_rows: []i64) void {
+fn calibrationRows(rows: u64, serial_rows: []i64, pool_rows: []i64, phase: CalibrationPhase) void {
     const half = rows / 2;
-    var seed: u64 = SPLITMIX_GAMMA;
+    var seed: u64 = if (phase == .load) SPLITMIX_GAMMA else SPLITMIX_M1;
     for (serial_rows) |*r| {
         r.* = @intCast(splitmix64(seed) % half);
         seed +%= SPLITMIX_GAMMA;
@@ -843,7 +867,6 @@ test "ngram table row dequant follows the MLX affine nibble layout" {
     @memcpy(aligned, &buf);
     const t = try NgramTable.parse(aligned, aligned[8..520], 520);
     try testing.expectEqual(@as(u32, 32), t.dim);
-
     var out: [32]f32 = undefined;
     t.row(0, &out);
     try testing.expectEqual(@as(f32, 1.0), out[0]);
@@ -987,13 +1010,28 @@ test "ngram prefill calibration: margin, invalid timers and explicit overrides" 
     try testing.expect(plePrefillPrefetchWanted(.on, 0, PREFILL_PREFETCH_MIN_KV, false));
 }
 
+test "ngram prefill calibration: warm measurements replace the cold policy" {
+    var pool: PrefetchPool = .{};
+    pool.recordCalibration(.{ .serial_ns = 1000, .pool_ns = 100, .phase = .load });
+    try testing.expect(pool.prefer_pool);
+    pool.recordCalibration(.{ .serial_ns = 100, .pool_ns = 1000, .phase = .warmed });
+    try testing.expect(!pool.prefer_pool);
+    pool.recordCalibration(.{ .serial_ns = 1000, .pool_ns = 100, .phase = .warmed });
+    try testing.expect(pool.prefer_pool);
+}
+
 test "ngram prefill calibration: sampled rows are bounded and disjoint" {
     for ([_]u64{ 256, 257, 320_000_000 }) |rows| {
         var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
         var pool_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
-        calibrationRows(rows, &serial_rows, &pool_rows);
-        for (serial_rows) |r| try testing.expect(r >= 0 and r < rows / 2);
-        for (pool_rows) |r| try testing.expect(r >= rows / 2 and r < rows);
+        calibrationRows(rows, &serial_rows, &pool_rows, .load);
+        const load_rows = serial_rows;
+        for ([_]CalibrationPhase{ .load, .warmed }) |phase| {
+            calibrationRows(rows, &serial_rows, &pool_rows, phase);
+            for (serial_rows) |r| try testing.expect(r >= 0 and r < rows / 2);
+            for (pool_rows) |r| try testing.expect(r >= rows / 2 and r < rows);
+        }
+        try testing.expect(!std.mem.eql(i64, &load_rows, &serial_rows));
     }
 }
 
@@ -1033,9 +1071,9 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     // Calibration exercises the actual mmap and pool, then leaves row values unchanged.
     t.calibrateArm();
     try testing.expectEqual(@as(u64, PLE_CALIBRATION_ROWS / PrefetchPool.MAX_ROWS), pool.runs.load(.monotonic));
-    try testing.expect(t.calib.serial_ns > 0 and t.calib.pool_ns > 0);
-    try testing.expectEqual(plePrefillPrefetchArm(t.calib.serial_ns, t.calib.pool_ns), t.prefer_pool);
-    t.prefer_pool = false;
+    try testing.expect(pool.calib.serial_ns > 0 and pool.calib.pool_ns > 0);
+    try testing.expectEqual(plePrefillPrefetchArm(pool.calib.serial_ns, pool.calib.pool_ns), pool.prefer_pool);
+    pool.prefer_pool = false;
 
     const ids = try testing.allocator.alloc(i64, ROWS);
     defer testing.allocator.free(ids);
@@ -1074,7 +1112,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     try testing.expectEqualSlices(f32, ref, got);
 
     // A measured pool win must engage below the KV gate without changing any row.
-    t.prefer_pool = true;
+    pool.prefer_pool = true;
     const calibrated_before = pool.runs.load(.monotonic);
     t.gather(ids, got, 8192);
     try testing.expectEqual(calibrated_before + ROWS / PrefetchPool.MAX_ROWS, pool.runs.load(.monotonic));
@@ -1113,6 +1151,32 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     t.gather(dec, d_got, 0);
     try testing.expectEqualSlices(f32, d_ref, d_got);
     try testing.expectEqual(serial_warm_before, said(0, 0));
+
+    // Warming must publish a refresh without borrowing the inference thread's reader pool.
+    ple_prefill_prefetch_override = null;
+    warm_override = true;
+    const before_warm = pool.runs.load(.monotonic);
+    t.startWarm();
+    (t.warm_thread orelse return error.WarmThreadMissing).join();
+    t.warm_thread = null;
+    try testing.expectEqual(before_warm, pool.runs.load(.monotonic));
+    try testing.expect(pool.warm_finished.load(.acquire));
+    try testing.expectEqual(CalibrationPhase.load, pool.calib.phase);
+
+    // Decode and explicit overrides leave refresh pending; automatic prefill consumes it once.
+    t.gather(dec, d_got, 0);
+    try testing.expect(pool.warm_finished.load(.acquire));
+    ple_prefill_prefetch_override = false;
+    t.gather(ids, got, 0);
+    try testing.expect(pool.warm_finished.load(.acquire));
+    ple_prefill_prefetch_override = null;
+    t.gather(ids, got, 0);
+    try testing.expect(!pool.warm_finished.load(.acquire));
+    try testing.expectEqual(CalibrationPhase.warmed, pool.calib.phase);
+    try testing.expectEqualSlices(f32, ref, got);
+    const after_refresh = pool.runs.load(.monotonic);
+    t.gather(ids, got, 0);
+    try testing.expectEqual(after_refresh + @as(u64, if (pool.prefer_pool) ROWS / PrefetchPool.MAX_ROWS else 0), pool.runs.load(.monotonic));
 }
 
 test "ngram table warm: touches the whole file in the background; close() joins mid-warm" {

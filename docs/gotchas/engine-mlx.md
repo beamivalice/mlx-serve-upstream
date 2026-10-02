@@ -4870,8 +4870,12 @@ bytes restored 825–1229 prompt tok/s. Resident mappings can favor serial reads
 so forcing the pool everywhere loses that benefit.
 
 `NgramTable.calibrateArm` samples 128 rows per arm before background warming,
-with disjoint row sets and a 20% margin. A measured pool win engages below the
-KV threshold; the threshold still handles later eviction at long context.
+with disjoint row sets and a 20% margin. Warming completion publishes an atomic
+refresh request; the next automatic wide gather measures fresh rows on the
+inference thread. The warmer never borrows the shared reader pool or mutates
+its policy. A resident table can return to serial; completion alone does not
+force serial on a table that cannot stay resident. The KV threshold still
+handles later eviction at long context.
 `QWEN4_PLE_PREFETCH_PREFILL=0|1` still forces either arm and skips calibration.
 BF16 and GPU table gathers retain their existing paths. The `ngram prefill`
 tests pin the margin, overrides, disjoint samples, actual pool engagement and
