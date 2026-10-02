@@ -160,6 +160,17 @@ Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no ne
 ### Hot prefix cache memory budget (`--prefix-cache-mem`)
 Wave 1.B — the hot prefix cache used to cap on entry count alone; with 4 KB-ctx entries on Gemma 4 E4B that's an 8 GB worst case. `--prefix-cache-mem N{KB,MB,GB}` (default 2 GB) caps resident KV bytes; `commit` evicts LRU entries until `current_kv_bytes + new_bytes <= budget`. `0`/`off` disables the byte cap (count cap still applies). Each `HotEntry` records its bytes at commit time (sum of `mlx_array_size × mlx_array_itemsize` across keys/values plus the scales/biases triples in quant mode). Log line: `[hot-cache] resident=X.XX / Y.YY MB (E entries)` on every commit / eviction.
 
+### Disabled prefix cache still reduced available context
+
+`--prefix-cache-entries 0` disabled allocation but left the configured RAM budget
+in context and prefill-chunk sizing. Gated architectures still reserved 2 GiB;
+other architectures reserved the raw ask. `/props` also reported that unused budget.
+All three reserve accessors now return zero when the entry count is zero;
+startup preserves zero rather than raising it to the concurrency count, and
+`/props` reads the effective budget.
+The `disabled prefix cache` unit test covers both architecture paths, several
+byte caps, and restoration of the enabled-cache behavior.
+
 ### head_dim-256 prefill: the msv_attn_p256 band kernel + the guards that stay load-bearing (long-context OOM class)
 MLX's fused SDPA covers head_dim ≤ 128 in prefill (`sdpa_full`; `sdpa_vector` covers 256 for seq ≤ 8); **every Gemma-4 and Qwen3.5/3.6 checkpoint ships head_dim 256**, whose prefill otherwise rides the composed path that MATERIALIZES a `[heads, chunk, total_kv]` bf16 score tensor per layer (tens of GB/layer at long ctx — the uncatchable Metal OOM class). The self-contained flash-style kernel `msv_attn_p256` (transformer.zig, `mlx_fast_metal_kernel`; FA-2 online softmax, register-resident Q, float32 accum) covers hd-256 prefill via `fusedSdpa256Prefill` (null → composed fallback). Scoping is three regimes:
 - **Sliding-band (Gemma local layers, `window > 0`): ALWAYS fused** (master kill `MLX_SERVE_FUSED_256=0`) — the band + block-skip run in-kernel so the GB-scale sliding mask is never built and out-of-band KV is never touched (composed has no answer). Output byte-identical; kernel-vs-composed one bf16 ULP.

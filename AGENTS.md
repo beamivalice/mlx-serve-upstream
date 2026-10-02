@@ -306,6 +306,7 @@ Memory bills + admission:
 - **"Free disk" is what the OS will GRANT** (`msv_volume_free_for_use`), statfs is the fallback.
 
 Prefix cache (RAM + SSD):
+- Disabled prefix retention reserves zero bytes in context sizing, chunk sizing and reported cache budgets; the configured byte cap is not proof that the cache exists.
 - **The hot-cache budget is CLAMPED at load, a HARD cap, and FOLLOWS residency** (#364, `clampedPrefixCacheMem`, `reviseHotCacheBudgets`). Guard: `tests/test_prefix_cache_budget_revisit.sh`.
 - **An oversized candidate is TRIMMED to the longest restorable prefix** (#330, `trimLenForBudget`, `trimmedCopy` a real copy; QSA bank priced via `trimmedCheckpointBytes`); the replace path sheds inherited checkpoints first; commit owns `ssm_cps` on EVERY outcome.
 - **A restored cache shares its donor's buffer; a SHORT restore regrows from the prefix** (`KVCache.restoredOversized`, #492): copying the donor's capacity let a "hi" chat hold 1.9 GB and evict the long session it matched.

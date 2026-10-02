@@ -914,6 +914,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -1814,7 +1815,7 @@ pub fn serve(
     // at every value so a default-1 boot does not read as "one at a time".
     if (scheduler_mod.configBatchesDecode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
@@ -3985,6 +3986,7 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
 fn legacyPrefixCacheAsk() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -5080,6 +5082,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
@@ -7384,7 +7387,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
         .max_concurrent = max_concurrent,
-        .prefix_cache_mem_bytes = prefix_cache_mem_bytes,
+        .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
@@ -24051,4 +24054,30 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "disabled prefix cache: sizing releases the cache reserve on every arch" {
+    const saved_capacity = prefix_cache_capacity;
+    const saved_ask = prefix_cache_mem_bytes;
+    defer prefix_cache_capacity = saved_capacity;
+    defer prefix_cache_mem_bytes = saved_ask;
+
+    var gated = longCtxTestConfig();
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+    const configs = [_]*model_mod.ModelConfig{ &gated, &other };
+    for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        prefix_cache_capacity = 0;
+        for (configs) |cfg| {
+            try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
+        }
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    }
+    prefix_cache_capacity = 32;
+    prefix_cache_mem_bytes = 10 << 30;
+    try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
+    try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
+    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }
