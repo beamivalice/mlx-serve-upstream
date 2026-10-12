@@ -32,6 +32,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `chat.zig` | Chat templates (ChatML/Gemma/Llama-3/Jinja2), thinking tags, tool-call parsing/repair/coercion |
 | `vision.zig` / `qwen_vision.zig` + `mrope.zig` | Gemma SigLIP / Qwen3-VL ViT + M-RoPE |
 | `muse_vision.zig` / `lfm2_vision.zig` / `glm_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling / GLM-5.3-Flash ViT + its padded-canvas processor |
+| `minicpm_vision.zig` / `minicpm_canvas.zig` | MiniCPM-V 4.7: SigLIP2 tower with the in-tower 2x2 window merger after layer 6 + merger MLP, the processor's thumbnail + crop slicing (each crop its own encoder call), and the canvas M-RoPE positions over the expanded prompt (pure host arithmetic) |
 | `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (embedded `src/html/index.html`, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
 | `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `alias` (a request NAME, never a load setting), `ctx_size`, `kv_quant`, `mtp`/`mtp_acceptance`/`mtp_greedy_tail`, `int8_prefill` (LOSSY), `chat_template_kwargs`; read at every load site, stamped on `ModelConfig.*_override` + `ChatConfig.chat_template_kwargs`. Detail: reference.md "row detail" |
@@ -143,7 +144,7 @@ Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental)
 | `gemma3`, `gemma3_text` | + flat text-only sibling; EmbeddingGemma encoder when `use_bidirectional_attention` |
 | `embedding_gemma2` | EmbeddingGemma 2: Gemma 4 trunk trained bidirectional (`forwardEmbeddingGemma2With`), projection-only PLE, INCLUSIVE band, head in the dense0 slot; images (Gemma 4 SigLIP tower, budgeted size) and video FRAMES ride `messages` on `/v1/embeddings`; no audio. Story: `docs/gotchas/models-media.md` |
 | `qwen3` | QK norm |
-| `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch, and MiniCPM-V 4.7 (`minicpmv4_7`, mlx-vlm layout) text-only: its SigLIP tower resolves no Qwen prefix |
+| `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch, and MiniCPM-V 4.7 (`minicpmv4_7`, mlx-vlm layout; SigLIP2 tower + canvas M-RoPE in `minicpm_vision.zig`/`minicpm_canvas.zig`, a pack without the tower serves text) |
 | `prism_hadamard_qwen35` | prism-ml Bonsai 2 = qwen3_5 behind block-1024 Hadamard rotations (`rht.zig`, `hadamard_block` from `modules[].block`); served in the pack's own numerics: f16 activations over its f16 scales, f32 GDN state; fused QKV declines; MTP depth 2 |
 | `qwen3_next` | DeltaNet |
 | `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix); pattern from `hybrid_override_pattern` OR `layers_block_type`; MoE = sigmoid router + ReLU^2 experts + shared expert; latent MoE refused at parse; attention is NoPE (`layer_no_rope`). MTP = a bare-key `mtp_head.safetensors` (`mtp.Layout.nemotron`), depth 2. Detail: reference.md "row detail" |
@@ -518,6 +519,7 @@ qwen4_exp:
 
 Vision:
 - **`x-mlx-pixels` is a GEMMA format** (`wantsServerPreprocess`; server refuses when `vp.mode != .gemma`); `VisionEncoder.forward` returns named errors.
+- **A MiniCPM-V image is SEVERAL encoder calls** (thumbnail + crops, `tile_*` on `ImageData`) laid out as `<image_id>N</image_id><image>…</image><slice>…</slice>` rows; the canvas M-RoPE table is built from the EXPANDED ids (`minicpm_canvas.canvasPositions`), so a changed placeholder run shifts every crop silently. Guard: the `MiniCPM-V 4.7` test in server.zig.
 - **A placeholder id the splice mask does not name never reaches the prompt** (`spliceVisionRows` takes `video_token_id`); a chunked splice resumes its ROW INDEX (#197, `vision_splice_offset`, `tests/test_vision_chunked_prefill.sh`); every generative forward arm splices vision (scan-pinned).
 - **Per-arch preprocessing**: patch feature order (LFM2-VL channel INNERMOST); two GELUs in one checkpoint (LFM2-VL); NaFlex resample is `bilinear` WITH antialias and TILING is the resolution; muse = aspect-closest grid, Lanczos, CHANNEL-major shuffle (`VisionPreproc.mode`). Guards: `tests/test_lfm2_vision.sh`, `tests/test_muse_vision.sh`.
 - **A processor pixel bound is not the ENGINE's** (`effectivePixelBounds`, `ENGINE_MAX_PIXELS` 1536²).

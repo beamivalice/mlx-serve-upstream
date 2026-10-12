@@ -26,6 +26,8 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("glm_vision.zig");
+    _ = @import("minicpm_vision.zig");
+    _ = @import("minicpm_canvas.zig");
     _ = @import("mrope.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");

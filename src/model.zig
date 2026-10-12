@@ -670,6 +670,22 @@ pub const ModelConfig = struct {
     glmv_swiglu_limit: f32 = 10.0,
     glmv_min_image_tokens: u32 = 16,
     glmv_max_image_tokens: u32 = 8000,
+    // MiniCPM-V 4.7 vision (src/minicpm_vision.zig): the SigLIP2 geometry rides the vision_*
+    // fields; these are its window merger, slicing and placeholder tokens. The token ids
+    // that are not in config.json come from the tokenizer (`populateMiniCpmImageTokens`).
+    minicpm_vision: bool = false,
+    mcv_insert_layer: u32 = 6,
+    mcv_downsample_4x: bool = false,
+    mcv_max_slice_nums: u32 = 9,
+    mcv_eps: f32 = 1e-6,
+    mcv_image_start_id: u32 = 0,
+    mcv_image_end_id: u32 = 0,
+    mcv_slice_start_id: u32 = 0,
+    mcv_slice_end_id: u32 = 0,
+    mcv_newline_id: u32 = 0,
+    mcv_image_id_start: u32 = 0,
+    mcv_image_id_end: u32 = 0,
+    mcv_digit_ids: [10]u32 = @splat(0),
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -1542,6 +1558,19 @@ pub const ModelConfig = struct {
             }
         }
         self.populateLfm2ImageTokens(tok);
+        self.populateMiniCpmImageTokens(tok);
+    }
+
+    /// MiniCPM-V's `<image_id>N</image_id>` tags and the digits of N are tokenizer-only ids.
+    /// A missing one leaves 0, which the run builder reads as "no image-id tag".
+    pub fn populateMiniCpmImageTokens(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (!self.minicpm_vision) return;
+        if (tok.special_tokens.get("</image_id>")) |id| self.mcv_image_id_end = id;
+        if (tok.special_tokens.get("<image_id>")) |id| self.mcv_image_id_start = id;
+        // Digits are single tokens in a byte-level BPE vocab (the pre-tokenizer splits every \p{N}).
+        for (&self.mcv_digit_ids, 0..) |*slot, digit| {
+            if (tok.vocab.get(&[_]u8{@intCast('0' + digit)})) |id| slot.* = id else self.mcv_image_id_start = 0;
+        }
     }
 
     /// LFM2-VL wraps its image-token run in `<|image_start|>`/`<|image_end|>`,
@@ -1708,6 +1737,20 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.glmv_max_image_tokens = hi;
             }
         }
+    }
+
+    if (config.minicpm_vision) {
+        const path = try std.fmt.allocPrint(allocator, "{s}/preprocessor_config.json", .{model_dir});
+        defer allocator.free(path);
+        if (std.Io.Dir.openFileAbsolute(io, path, .{})) |file| {
+            defer file.close(io);
+            var buf: [4096]u8 = undefined;
+            var reader = file.reader(io, &buf);
+            if (reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |json| {
+                defer allocator.free(json);
+                config.mcv_max_slice_nums = parseMaxSliceNumsFromJson(json) orelse config.mcv_max_slice_nums;
+            } else |_| {}
+        } else |_| {}
     }
 
     if (config.isEmbeddingGemma2()) {
@@ -2074,6 +2117,53 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
     if (jsonField(root, "vision_end_token_id")) |v| {
         if (v == .integer) config.vision_end_token_id = try jsonU32(v);
     }
+}
+
+/// MiniCPM-V 4.7's tower options (`src/minicpm_vision.zig`). The generic `vision_config` block has
+/// already read the SigLIP2 geometry; this adds the window merger, the downsample mode and the
+/// token ids config.json carries. One round of 2x2 merging in each merger is the only shape served.
+fn parseMiniCpmVision(config: *ModelConfig, root: std.json.ObjectMap) !void {
+    const vc_val = jsonField(root, "vision_config") orelse return;
+    if (vc_val != .object) return;
+    const vc = vc_val.object;
+    config.minicpm_vision = true;
+    // Video frames are not served: no `<|video_pad|>` placeholder, no "video" modality.
+    config.video_token_id = 0;
+    if (jsonField(root, "insert_layer_id")) |v| config.mcv_insert_layer = try jsonU32(v);
+    if (jsonField(vc, "layer_norm_eps")) |v| config.mcv_eps = try jsonFloat(v);
+    if (config.mcv_insert_layer >= config.vision_num_layers) return error.InvalidConfigField;
+    if (jsonField(root, "downsample_mode")) |v| {
+        const mode = try jsonValue(.string, v);
+        if (std.mem.eql(u8, mode, "4x")) {
+            config.mcv_downsample_4x = true;
+        } else if (!std.mem.eql(u8, mode, "16x")) return error.InvalidConfigField;
+    }
+    if (jsonField(root, "merger_times")) |v| {
+        if (try jsonU32(v) != 1) return error.InvalidConfigField;
+    }
+    for ([_]std.json.ObjectMap{ root, vc }, [_][]const u8{ "merge_kernel_size", "window_kernel_size" }) |obj, key| {
+        const v = jsonField(obj, key) orelse continue;
+        const kernel = try jsonValue(.array, v);
+        if (kernel.items.len != 2 or try jsonU32(kernel.items[0]) != 2 or try jsonU32(kernel.items[1]) != 2) return error.InvalidConfigField;
+    }
+    const ids = .{
+        .{ "image_start_id", &config.mcv_image_start_id },
+        .{ "image_end_id", &config.mcv_image_end_id },
+        .{ "slice_start_id", &config.mcv_slice_start_id },
+        .{ "slice_end_id", &config.mcv_slice_end_id },
+        .{ "newline_id", &config.mcv_newline_id },
+    };
+    inline for (ids) |entry| {
+        if (jsonField(root, entry[0])) |v| entry[1].* = try jsonU32(v);
+    }
+}
+
+/// `max_slice_nums` of the checkpoint's `preprocessor_config.json` (null when absent or 0).
+pub fn parseMaxSliceNumsFromJson(content: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    return positiveJsonU32(parsed.value.object.get("max_slice_nums"));
 }
 
 /// Flat HF `rope_parameters` carrying `rope_type: "yarn"` — the YaRN context
@@ -2879,8 +2969,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
         std.mem.eql(u8, model_type, "qwen3_5_text") or
         std.mem.eql(u8, model_type, "prism_hadamard_qwen35") or
-        // MiniCPM-V 4.7: a Qwen3.5 trunk in mlx-vlm's layout; its SigLIP tower
-        // resolves no Qwen3-VL prefix, so vision stays off.
+        // MiniCPM-V 4.7: a Qwen3.5 trunk behind a SigLIP2 tower (src/minicpm_vision.zig).
         std.mem.eql(u8, model_type, "minicpmv4_7"))
     {
         config.model_type = "qwen3_5_moe";
@@ -2899,6 +2988,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         try parseQwenVisionFields(&config, root, cfg_obj);
+        if (std.mem.eql(u8, model_type, "minicpmv4_7")) {
+            // Its vision_config is a SigLIP2 tower, not Qwen3-VL's.
+            config.qwen_vision = false;
+            try parseMiniCpmVision(&config, root);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen4_exp") or
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
@@ -5280,6 +5374,8 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "vision_model.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
+        std.mem.startsWith(u8, key, "merger.") or
+        std.mem.startsWith(u8, key, "vit_merger.") or
         std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "embed_audio.") or
         std.mem.startsWith(u8, key, "multi_modal_projector.") or
@@ -6001,6 +6097,14 @@ test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision
     try testing.expect(!shouldKeepWeightKey("embed_audio.embedding_projection.weight", false));
     // The conformer audio tower is never wired — always dropped.
     try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
+}
+
+test "shouldKeepWeightKey gates MiniCPM-V's tower and both mergers on load_vision" {
+    for ([_][]const u8{ "vision_tower.encoder.layers.0.mlp.fc1.weight", "vit_merger.linear_1.weight", "merger.mlp.0.linear_1.weight" }) |key| {
+        try testing.expect(!shouldKeepWeightKey(key, false));
+        try testing.expect(shouldKeepWeightKey(key, true));
+    }
+    try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.mlp.gate.weight", false));
 }
 
 test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nestings" {
@@ -9793,4 +9897,79 @@ test "parseConfigFromJson accepts real checkpoint configs" {
         }
     }
     try testing.expect(!failed);
+}
+
+test "minicpmv4_7: the checkpoint's real config binds the Qwen3.5-MoE trunk" {
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"));
+    defer config.deinit(testing.allocator);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 2048), config.hidden_size);
+    try testing.expectEqual(@as(u32, 248144), config.vocab_size);
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 512), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 4), config.full_attention_interval);
+    try testing.expectEqual(@as(u32, 256), config.head_dim);
+    try testing.expectEqual(@as(f32, 1e7), config.rope_theta);
+    try testing.expectEqual(@as(f32, 0.25), config.partial_rotary_factor);
+    try testing.expect(config.attn_output_gate and config.has_qk_norm and !config.tie_word_embeddings);
+    try testing.expect(config.mrope_interleaved);
+    try testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &config.mrope_section);
+    try testing.expect(config.isLinearLayer(2) and !config.isLinearLayer(3) and !config.isLinearLayer(39));
+    // The SigLIP2 tower is its own arch, not Qwen3-VL's.
+    try testing.expect(config.has_vision and config.minicpm_vision and !config.qwen_vision);
+    try testing.expectEqual(@as(u32, 27), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 1152), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 4304), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 6), config.mcv_insert_layer);
+    try testing.expect(!config.mcv_downsample_4x);
+    try testing.expectEqual(@as(u32, 248056), config.image_token_id);
+    try testing.expectEqual(@as(u32, 0), config.video_token_id);
+    try testing.expectEqual(@as(u32, 248078), config.mcv_image_start_id);
+    try testing.expectEqual(@as(u32, 248079), config.mcv_image_end_id);
+    try testing.expectEqual(@as(u32, 248088), config.mcv_slice_start_id);
+    try testing.expectEqual(@as(u32, 248089), config.mcv_slice_end_id);
+    try testing.expectEqual(@as(u32, 198), config.mcv_newline_id);
+}
+
+test "minicpmv4_7 downsample_mode 4x skips the window merger, an unknown mode is refused" {
+    const four = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"), "\"16x\"", "\"4x\"");
+    defer testing.allocator.free(four);
+    var config = try parseConfigFromJson(testing.allocator, four);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.mcv_downsample_4x);
+
+    const odd = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"), "\"16x\"", "\"8x\"");
+    defer testing.allocator.free(odd);
+    try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, odd));
+}
+
+test "minicpmv4_7 image slice budget comes from preprocessor_config" {
+    try testing.expectEqual(@as(?u32, 9), parseMaxSliceNumsFromJson("{\"max_slice_nums\": 9, \"mrope_mode\": \"canvas\"}"));
+    try testing.expectEqual(@as(?u32, null), parseMaxSliceNumsFromJson("{\"max_slice_nums\": 0}"));
+    try testing.expectEqual(@as(?u32, null), parseMaxSliceNumsFromJson("{}"));
+}
+
+test "minicpmv4_7 resolves its tokenizer-only image tokens by string" {
+    var tok: tokenizer_mod.Tokenizer = undefined;
+    tok.vocab = std.StringHashMap(u32).init(testing.allocator);
+    defer tok.vocab.deinit();
+    tok.special_tokens = std.StringHashMap(u32).init(testing.allocator);
+    defer tok.special_tokens.deinit();
+    const digits = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+    for (digits, 0..) |d, i| try tok.vocab.put(d, @intCast(15 + i));
+    try tok.special_tokens.put("<image_id>", 248090);
+    try tok.special_tokens.put("</image_id>", 248091);
+
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/minicpmv4_7.json"));
+    defer config.deinit(testing.allocator);
+    config.populateMiniCpmImageTokens(&tok);
+    try testing.expectEqual(@as(u32, 248090), config.mcv_image_id_start);
+    try testing.expectEqual(@as(u32, 248091), config.mcv_image_id_end);
+    try testing.expectEqual(@as(u32, 15), config.mcv_digit_ids[0]);
+    try testing.expectEqual(@as(u32, 24), config.mcv_digit_ids[9]);
 }
