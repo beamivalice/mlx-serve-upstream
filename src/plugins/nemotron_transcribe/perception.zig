@@ -1,7 +1,8 @@
 //! Nemotron 3.5 Transcribe's perception module (mlx-audio's `nemotron_transcribe/perception.py`, NeMo's
-//! `ParallelExpertEncoderPT`): NeMo log-mels normalized per feature over the whole clip, a feature-stacking RoPE
-//! Transformer (the ASR expert) and a Sortformer speaker encoder (the speaker expert) over 40 s windows with context,
-//! the speaker activity fused into the ASR rows through a sinusoidal kernel, then a linear projection to the trunk.
+//! `ParallelExpertEncoderPT`): NeMo log-mels, a feature-stacking RoPE Transformer (the ASR expert, fed the mels
+//! normalized per feature over the whole clip) and a Sortformer speaker encoder (the speaker expert, fed the RAW mels:
+//! `perception.py` normalizes for the ASR expert only) over 40 s windows with context, the speaker activity fused into
+//! the ASR rows through a sinusoidal kernel, then a linear projection to the trunk.
 //! The speaker half is `nemotron_diarization`'s streaming (FIFO + arrival-order speaker cache) with left context.
 //! Activations run in the weights' dtype (bf16), the speaker probabilities and the cache scores in f32.
 
@@ -399,6 +400,7 @@ const Stream = struct {
         const fifo = if (st.fifo) |v| try g.concat(&.{ v, own }, 1) else own;
         const queued = nf + n;
         if (queued <= sc.fifo) return st.replace(g, st.cache, fifo);
+        // mlx-audio's `streaming_step`: the update period (300) outsizes the FIFO (40), so its first overflow pops all of it.
         const pop = @min(queued, @max(sc.period, queued - sc.fifo));
         const total = nc + pop;
         const low = try gpa.alloc(f32, total * spk);
@@ -407,7 +409,10 @@ const Stream = struct {
             const row = if (r < nc) r else if (r - nc < nf) r else first + (r - nc - nf);
             for (0..spk) |s| low[r * spk + s] = rowMean(high, row, s, f, spk);
         }
-        if (st.compressed) @memcpy(low[0 .. nc * spk], st.cache_probs);
+        if (st.compressed) {
+            if (st.cache_probs.len != nc * spk) return error.SpeakerCache;
+            @memcpy(low[0 .. nc * spk], st.cache_probs);
+        }
         const popped = try g.sliceAxis(fifo, 1, 0, @intCast(pop));
         const rest: ?Array = if (pop < queued) try g.sliceAxis(fifo, 1, @intCast(pop), @intCast(queued)) else null;
         const grown = if (st.cache) |v| try g.concat(&.{ v, popped }, 1) else popped;

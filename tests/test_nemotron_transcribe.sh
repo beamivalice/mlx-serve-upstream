@@ -117,6 +117,5 @@ st, r = chat([{"type": "text", "text": spk}, said("two")], skip_special_tokens=F
 text = r["choices"][0]["message"]["content"] if st == 200 else ""
 ok("[8] two voices carry speaker tags", st == 200 and "<spk:0>" in text and "<spk:1>" in text, text)
 
-print("server log lines naming the tower:", len(re.findall(r"nemotron_transcribe|perception", open(log).read())))
 sys.exit(1 if fails else 0)
 PY

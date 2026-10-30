@@ -1326,3 +1326,10 @@ write-through and, another day, in `HotPrefixCache.deinit`. Cause: the commit pi
 arrays or filed rows under another prompt. Fix: the target crosses the refresh by id (`indexOfId`); an evicted target is
 a fresh store. Guard: the two `across an SSD-first refresh that evicts` tests, each in both orders.
 
+
+### A plugin that rewrote `Forward.tokens` heard nothing in the live engine (nemo_speechlm)
+Defect: Nemotron Transcribe answered "We are." to a spoken sentence; unit tests were green. Cause: its `forward` swapped
+the out-of-table `<|audio|>` id for a stand-in in `f.tokens`, but the engine sends ids as a device array
+(`Forward.ids`) and leaves `tokens` empty, so the swap never ran, the splice never matched and the rows were dropped.
+Fix: the swap covers both forms. Rule: a plugin that reads or rewrites ids handles `f.ids` as well as `f.tokens`.
+Guard: the splice proof runs the same prefill through host tokens and through a device array and demands equal logits.

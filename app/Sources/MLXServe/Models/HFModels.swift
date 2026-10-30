@@ -55,6 +55,7 @@ let supportedModelTypes: Set<String> = [
     "lfm2", "lfm2_vl", "lfm2-vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni", // Liquid LFM3: text, VL, speech in + out, all of it
     "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni",
+    "nemo_speechlm", // NVIDIA Nemotron 3.5 Transcribe (speech in, Nemotron-H trunk)
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)

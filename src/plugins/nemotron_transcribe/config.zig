@@ -26,8 +26,13 @@ pub const SAMPLE_RATE: u32 = 16000;
 pub const HOP: u32 = 160;
 pub const STACK: u32 = 8;
 
-/// The reserved special token the tower's rows ride in the prompt: `<|audio|>` is id `vocab_size`, past the table.
+/// `<|audio|>` is id `vocab_size`, past the embedding table, so the trunk's gather reads this reserved token
+/// (`<SPECIAL_999>`) in its rows instead; a pack too small for it takes its last id.
 pub const SPLICE_ID: u32 = 999;
+
+pub fn spliceId(vocab: u32) u32 {
+    return @min(SPLICE_ID, vocab -| 1);
+}
 
 /// One feature-stacking Transformer encoder.
 pub const Encoder = struct {
@@ -185,6 +190,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     if (audio.rate != SAMPLE_RATE or audio.hop != HOP or audio.stack != STACK) return refuse(out, .unsupported, "a sample rate, hop or stacking factor other than 16 kHz / 160 / 8");
     if (audio.out_dim != out.shell.hidden_size) return refuse(out, .failed, "the perception output is not the trunk's width");
     const id = json.int(json.field(root, "audio_token_id")) orelse return refuse(out, .failed, "no audio_token_id");
+    if (out.shell.vocab_size < 2 or id == spliceId(out.shell.vocab_size)) return refuse(out, .failed, "no room for the splice stand-in id");
     out.caps.audio = true;
     out.placeholder_ids.audio = id;
     out.weights.prefix = abi.Str.of("llm.backbone");
@@ -238,6 +244,20 @@ test "nemotron_transcribe config: the NeMo trunk parses through nemotron_h, audi
     try testing.expect(p.caps.audio and p.caps.moe);
     try testing.expectEqual(@as(u32, 131072), p.placeholder_ids.audio);
     try testing.expectEqualStrings("llm.backbone", p.weights.prefix.slice());
+}
+
+test "nemotron_transcribe config: the splice stand-in is an id inside the table, never the audio id" {
+    try testing.expectEqual(@as(u32, 999), spliceId(131072));
+    try testing.expectEqual(@as(u32, 63), spliceId(64));
+    const mem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = sample_json }} };
+    const dir = mem.packDir();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const clash = try std.mem.replaceOwned(u8, arena.allocator(), sample_json, "\"audio_token_id\":131072", "\"audio_token_id\":999");
+    var p: abi.Parsed = .{};
+    const v = parse(&dir, abi.Str.of(clash), .{}, null, true, &p);
+    try testing.expect(!v.isOk());
+    try testing.expect(std.mem.indexOf(u8, v.why.slice(), "splice stand-in") != null);
 }
 
 test "nemotron_transcribe config: the perception geometry and the streaming defaults" {

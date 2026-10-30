@@ -18,9 +18,11 @@ speaker-attributed and rich transcription, audio questions). Pack layout = mlx-a
 - The perception module stays bf16 in a quantized pack; only `llm.*` quantizes. Mamba `A_log`/`D`/`dt_bias`, the router and
   its correction bias keep f32 in the pack.
 - The prompt's rows are `<|audio|>` (the engine requires its `placeholder_ids.audio` in the run), id `vocab_size`: one
-  past the embedding table. `forward` swaps those ids for `<SPECIAL_999>` before the trunk gathers them, and the splice
-  (`base.placeholders.audio`) overwrites the rows. The engine hands its ids as a device array (`Forward.ids`, `tokens`
-  empty), so the swap covers both forms; a test that passes host `tokens` only never runs the engine's path.
+  past the embedding table. `forward` swaps those ids for `<SPECIAL_999>` (`config.spliceId`; a pack too small for it
+  takes its last id, `parse` refuses a clash) before the trunk gathers them, and the splice (`base.placeholders.audio`)
+  overwrites the rows. The engine hands its ids as a device array (`Forward.ids`, `tokens` empty), so the swap covers
+  both forms; a test that passes host `tokens` only never runs the engine's path (`docs/gotchas/engine-mlx.md`).
+- The speaker expert reads the RAW mels and the ASR expert the normalized ones (`perception.py`).
 - A clip is split into 40 s windows with 50 rows of context either side; features are normalized over the WHOLE clip first.
 
 ## Rules
@@ -32,5 +34,8 @@ speaker-attributed and rich transcription, audio questions). Pack layout = mlx-a
   language in it and `prompt` takes the contextual recipe, never both.
 
 ## Not served
+- `language` is the Qwen3-ASR list (the host's `/v1/audio/transcriptions` validation), not the card's 40 languages: a
+  language outside it is a named 400; leave `language` out and the model detects it.
+- The app's dictation and transcript surfaces pick their pack by `qwen3_asr`, so they ignore a loaded Nemotron Transcribe.
 - Word timestamps (the CTC head), `diarized_json` from the embedded speaker model, MTP and the DFlash2 drafter: the pack
   keeps no CTC tensors and `spec` is empty.

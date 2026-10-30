@@ -37,6 +37,8 @@ pub const Loaded = struct {
     tower: perception.Tower,
     /// The tokenizer's `<|audio|>`: what the prompt's rows hold (`Parsed.placeholder_ids.audio`).
     audio_id: u32,
+    /// The in-table id the trunk gathers in their place (`config.spliceId`) and the splice matches.
+    splice_id: u32,
     owned: reader.Owned = .{},
 };
 
@@ -52,6 +54,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const trunk = try nh.loadModel(ctx);
     errdefer nh.table.unload(trunk);
+    // `Parsed.private` is nemotron_h's `Config`, which keeps no perception block: read the file again for it.
     const bytes = try gpa.alloc(u8, CONFIG_CAP);
     defer gpa.free(bytes);
     var why: Verdict = .ok;
@@ -63,11 +66,11 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
 
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);
-    m.* = .{ .trunk = trunk, .tower = undefined, .audio_id = ctx.parsed.placeholder_ids.audio };
+    m.* = .{ .trunk = trunk, .tower = undefined, .audio_id = ctx.parsed.placeholder_ids.audio, .splice_id = config.spliceId(ctx.parsed.shell.vocab_size) };
     errdefer m.owned.deinit();
     m.tower = try perception.Tower.load(ctx, audio, nh.config.of(ctx.parsed).block_json, &m.owned);
     // `forward` swaps the prompt's `<|audio|>` rows for this id before the trunk reads them.
-    trunk.base.placeholders.audio = config.SPLICE_ID;
+    trunk.base.placeholders.audio = m.splice_id;
     return m;
 }
 
@@ -82,8 +85,9 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
     // The prompt's rows are `<|audio|>`, id `vocab_size`: one past the embedding table. The splice overwrites those
-    // rows, so the gather reads a stand-in token (`SPLICE_ID`) there instead. The engine hands its ids as a device
-    // array (`Forward.ids`, `tokens` empty); a direct caller hands host tokens.
+    // rows, so the gather reads a stand-in token (`splice_id`) there instead. The engine hands its ids as a device
+    // array (`Forward.ids`, `tokens` empty); a direct caller hands host tokens. Device ids cannot be searched without
+    // a sync, so that arm rewrites every prompt chunk (a few tiny ops) where the host arm skips an audio-free one.
     if (f.mode == .decode) return nh.table.forward(m.trunk, f, out);
     var swapped_forward = f.*;
     if (f.ids.ctx != null) {
@@ -91,7 +95,7 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
         defer g.deinit();
         const ids: ops.Array = .{ .ctx = f.ids.ctx };
         const hit = g.equal(ids, g.scalarLike(ids, @floatFromInt(m.audio_id)) catch return oom()) catch return oom();
-        const swapped = g.where(hit, g.scalarLike(ids, @floatFromInt(config.SPLICE_ID)) catch return oom(), ids) catch return oom();
+        const swapped = g.where(hit, g.scalarLike(ids, @floatFromInt(m.splice_id)) catch return oom(), ids) catch return oom();
         swapped_forward.ids = .{ .ctx = swapped.ctx };
         return nh.table.forward(m.trunk, &swapped_forward, out);
     }
@@ -99,7 +103,7 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     if (std.mem.indexOfScalar(u32, ids, m.audio_id) == null) return nh.table.forward(m.trunk, f, out);
     const swapped = gpa.alloc(u32, ids.len) catch return oom();
     defer gpa.free(swapped);
-    for (swapped, ids) |*s, id| s.* = if (id == m.audio_id) config.SPLICE_ID else id;
+    for (swapped, ids) |*s, id| s.* = if (id == m.audio_id) m.splice_id else id;
     swapped_forward.tokens = .of(swapped);
     return nh.table.forward(m.trunk, &swapped_forward, out);
 }
