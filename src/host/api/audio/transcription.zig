@@ -327,7 +327,7 @@ pub fn buildPrompt(a: std.mem.Allocator, context: ?[]const u8, language: ?[]cons
 /// Nemotron 3.5 Transcribe's user-turn instruction: the card's verbatim recipe (its `processor_config.json` default)
 /// with the language named when the client forced one, or its contextual recipe over the client's context terms.
 pub fn nemoPrompt(a: std.mem.Allocator, context: ?[]const u8, language: ?[]const u8) ![]u8 {
-    if (context) |c| return std.fmt.allocPrint(a, "Transcribe with punctuation and capitalization. Context terms: {s}.", .{c});
+    if (context) |c| return std.fmt.allocPrint(a, "Transcribe with punctuation and capitalization. Context terms: {s}.", .{std.mem.trimEnd(u8, c, ". ")});
     return std.fmt.allocPrint(a, "Audio transcription. Language: {s}. Wording: verbatim, including fillers and repetitions. Formatting: punctuation and capitalization. Output: transcript only.", .{language orelse "as spoken"});
 }
 

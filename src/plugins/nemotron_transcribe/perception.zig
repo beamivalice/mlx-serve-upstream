@@ -205,6 +205,7 @@ pub const Tower = struct {
         try ops.eval(t.fb);
         const win = try g.astype(try arr(&r, owned, "perception.preprocessor.window"), .float32);
         try ops.eval(win);
+        if (mlx.mlx_array_size(win) != cfg.win) return error.WindowRead;
         const taps = (mlx.mlx_array_data_float32(win) orelse return error.WindowRead)[0..cfg.win];
         t.window = try gpa.alloc(f32, cfg.n_fft);
         errdefer gpa.free(t.window);

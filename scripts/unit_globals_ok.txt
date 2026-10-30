@@ -103,3 +103,5 @@ host.registry.memory_ceiling.wired_limit_bytes_cached
 sdk.spec.mtp.mtp.top32_final_cached
 sdk.spec.mtp.mtp.top32_partial_cached
 sdk.blocks.linear.verify_projection.verify_wide_configs
+# foreign quant layouts an outside plugin registers in its own dylib; a server unit holds an empty copy
+sdk.quant.foreign.registry

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const mlx_gguf = @import("../../quant/gguf/root.zig");
+const foreign = @import("../../quant/foreign.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const testing = std.testing;
@@ -19,8 +19,7 @@ const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmN
 /// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
 /// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
 pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, sorted: bool, s: mlx.mlx_stream) !void {
-    if (mlx_gguf.kernels.infoOf(w, sc)) |info| {
-        const y = try mlx_gguf.kernels.gatherLinear(info, x, w, lhs_idx, rhs_idx, s);
+    if (try foreign.gather(x, w, sc, lhs_idx, rhs_idx, s)) |y| {
         _ = mlx.mlx_array_free(res.*);
         res.* = y;
         return;

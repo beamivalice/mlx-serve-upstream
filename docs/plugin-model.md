@@ -42,8 +42,9 @@ The example is a fixture, not a loader for real packs. Check the checkpoint's `c
   `vocab x hidden` matrix.
 - **Config JSON is untrusted.** Bounds-check every field before use (the scaffold does); refuse what you do not
   implement by name.
-- **Dense only.** The example's matmul takes unquantized weights. Quantized packs need the SDK's quant linear blocks
-  (`kit.sdk`), or [a quant plugin](plugin-quant.md).
+- **Dense only.** The example's matmul takes unquantized weights. An MLX-quantized pack (affine, mxfp4/8, nvfp4)
+  runs through mlx-c's own `mlx_quantized_matmul` and `mlx_gather_qmm`; any other encoding is
+  [a quant plugin](plugin-quant.md).
 
 Weight names and config keys should match mlx-lm so packs load across engines.
 
@@ -78,14 +79,23 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
   `cache_ops.release(&view)`. `fwd.logits` says `last_row`, `all_rows` or `none`. Everything you allocate per step
   is freed per step (the scaffold's `Graph` does this).
 - **MLX** is the mlx-c API (`@import("mlx_c")`): ops like `mlx_fast_rms_norm`, `mlx_fast_rope`,
-  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. `kit.sdk` also ships blocks (attention, MLP, MoE, norms, RoPE)
-  and test fixtures; read what it exports in `src/sdk/root.zig` before hand-writing a layer.
+  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. A plugin can write its layers on mlx-c, or call the
+  server's own blocks through `kit.blocks`: norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the
+  transformer blocks (linear, qmm, mlp, rope, attention, moe, hc, gdn; Metal only, no CUDA files). Blocks are
+  compiled into your dylib and take `kit.mlx` handles (`{ ctx }`, like mlx-c's: convert with `.{ .ctx = x.ctx }`).
+  They are versioned with the kit and a newer kit may rename or change them: build against one kit and pin it.
+  A block that does not apply returns null and the caller keeps its own ops (`_example`'s `addNorm`).
+- **Your own weight layout.** `qmatmul` and the expert matmul read a layout they do not know through
+  `kit.foreign`: register a `Format` (`claims` the (weight, scales) pair, `linear`, optionally `gather`) in `load`,
+  before the first forward. The server's own foreign formats (GGUF, fp8) are not in the kit's list. Beyond that,
+  `kit.sdk` holds the claim helpers and the test fixtures.
 
 ## Read these in the kit
 
 The kit carries the contract and a working example, so a plain decoder needs nothing from the mlx-serve repo.
 
 - `examples/_example/plugin.zig`: a complete working decoder (about 270 lines). Start from `plugin new`, which copies it.
+- [plugin-abi.md](plugin-abi.md): every table, struct, field and enum of the ABI, generated from `src/abi/`.
 - `src/abi/plugin.zig`: every struct above with field comments (`Shell`, `Caps`, `Parsed`, `Bill`, `LoadCtx`,
   `Forward`, `CacheOps`, `ForwardOut`). The authoritative reference.
 - `src/sdk/root.zig` and `src/kit.zig`: what `kit.sdk` and `kit.generation` export.

@@ -22,6 +22,7 @@ speaker-attributed and rich transcription, audio questions). Pack layout = mlx-a
   takes its last id, `parse` refuses a clash) before the trunk gathers them, and the splice (`base.placeholders.audio`)
   overwrites the rows. The engine hands its ids as a device array (`Forward.ids`, `tokens` empty), so the swap covers
   both forms; a test that passes host `tokens` only never runs the engine's path (`docs/gotchas/engine-mlx.md`).
+- A user message that tokenizes to `<SPECIAL_999>` (the stand-in) is spliced like an audio row: accepted, unlikely.
 - The speaker expert reads the RAW mels and the ASR expert the normalized ones (`perception.py`).
 - A clip is split into 40 s windows with 50 rows of context either side; features are normalized over the WHOLE clip first.
 

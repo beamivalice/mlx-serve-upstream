@@ -136,8 +136,8 @@ pub fn parseAudio(root: json.Object) Error!Audio {
     if (!(json.boolean(json.field(dm, "high_resolution")) orelse false)) return error.Unsupported;
 
     const rate = try uint(pre, "sample_rate", 16000);
-    const hop: u32 = @intFromFloat(@as(f64, @floatFromInt(rate)) * try num(pre, "window_stride", 0.01));
-    const win: u32 = @intFromFloat(@as(f64, @floatFromInt(rate)) * try num(pre, "window_size", 0.025));
+    const hop: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(rate)) * try num(pre, "window_stride", 0.01)));
+    const win: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(rate)) * try num(pre, "window_size", 0.025)));
     const mode = json.string(json.field(pe, "speaker_feature_mode")) orelse return error.Unsupported;
     const thresholded = std.mem.eql(u8, mode, "thresholded");
     if (!thresholded and !std.mem.eql(u8, mode, "continuous")) return error.Unsupported;

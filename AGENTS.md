@@ -10,7 +10,8 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 - `src/{host,host/chat,engines/mlx,plugins}/AGENTS.md` — each area's rules, one line each. `docs/recipes/` — add a model, extend one, a media backend, a kernel, an engine, an API field. `docs/plugins.md` — the plugin guide.
 - `docs/CUDA.md` — NVIDIA (Linux, Windows): builds, our own CUDA kernels, per-device defaults, memory, measuring, MLX patches.
 - `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules; `app-web/CLAUDE.md` — console source (auto-load in their dirs).
-- Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
+- Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps),
+  `/plugin` (create, check, install and A/B an outside plugin dylib).
 - `containers/{agent-shell-mlxserve,guest-kernel}/` — Agent Sandbox guest image + kernel, two pinned artifacts that BUMP TOGETHER. Detail: `docs/reference.md`.
 - `website/` — GitHub Pages site + `llm-tier-list/`. Design: `docs/reference.md`. Guards: `tests/test_website_pages.sh`, `tests/website_tier_list_logic.mjs`.
 - **Growth policy (ENFORCED)**: this file stays under 30k bytes (the map, the global rules, the inner loop), a folder's rules live in its own `AGENTS.md`, short-form and minimal; EVERY rule bullet is ≤ 3 lines. Be PICKY: a rule earns a line only for a real bug or a strong gotcha we actually hit and that someone would repeat. Not a diary: no log of what happened, no measurements, no round-by-round notes, no restating what the code or git history says. Same bar for `docs/gotchas/*.md` (one short story per gotcha) and `docs/reference.md` (one section per subsystem). When in doubt, leave it out; App content → `app/CLAUDE.md`.
