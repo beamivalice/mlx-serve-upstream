@@ -106,8 +106,13 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     // and the repack's departs from encoding.py; ours is pinned to the encoder.
     const dsv41 = dirModelTypeIs(io, allocator, model_dir, "deepseek_v41");
     if (dsv41) log.info("chat: deepseek_v41 — using the embedded V4.1 transcription\n", .{});
+    // Nemotron Transcribe's own template repeats a list (`["<|audio|>"] * n`), which jinja.cpp cannot run; a failed render
+    // drops to the generic format, which carries no audio placeholder.
+    const nemo_speech = dirModelTypeIs(io, allocator, model_dir, "nemo_speechlm");
     const chat_template: []const u8 = if (dsv41)
         try allocator.dupe(u8, @embedFile("../../fixtures/dsv41_chat_template.jinja"))
+    else if (nemo_speech)
+        try allocator.dupe(u8, @embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"))
     else if (chatTemplateFromValue(root.get("chat_template"))) |t|
         try allocator.dupe(u8, t)
     else blk: {
@@ -396,4 +401,18 @@ test "loadChatConfig: deepseek_v41 always gets the embedded V4.1 transcription" 
     var cc2 = try loadChatConfig(io, allocator, pbuf[0..plen]);
     defer cc2.deinit();
     try testing.expectEqualStrings(embedded, cc2.chat_template);
+}
+
+test "loadChatConfig: nemo_speechlm always gets the embedded template, whatever the pack ships" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\", \"chat_template\": \"{{ shipped }}\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"nemo_speechlm\"}" });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    var cc = try loadChatConfig(io, allocator, pbuf[0..plen]);
+    defer cc.deinit();
+    try testing.expectEqualStrings(@embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"), cc.chat_template);
 }

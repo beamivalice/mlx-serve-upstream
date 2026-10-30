@@ -4,6 +4,7 @@
 
 - **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
 - **Outside plugins can draft and see.** A plugin can run its own speculative drafter (greedy or sampled requests), serve images through its own vision tower, and read the model's `ctx_size` to size its memory.
+- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, translation, speaker-tagged transcripts and questions about a recording, on `/v1/audio/transcriptions` and as audio in chat; convert NVIDIA's checkpoint with `scripts/convert_nemotron_transcribe.py`.
 - **DiffusionGemma is no longer supported.**
 - **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
 

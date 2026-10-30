@@ -86,7 +86,7 @@ const uncovered = [_][]const u8{
     "embedding_gemma2", "gemma4_unified_text",
     "qwen3_moe_text",   "qwen4_exp_text",
     "qwen3_5_text",     "qwen3_5_moe_text",
-    "glm5_next_text",
+    "glm5_next_text",    "nemo_speechlm",
     // mlx-community's Nemotron-Nano-9B-v2 has a bare `Infinity`, which the legacy parse refuses too.
       "nemotron_h",
 };

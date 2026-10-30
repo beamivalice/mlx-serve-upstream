@@ -2195,6 +2195,33 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
     }
 }
 
+test "chat: the embedded Nemotron Transcribe template renders through jinja.cpp byte-exact with NVIDIA's" {
+    // Cases and reference bytes from tests/nemo_speechlm_template_ab.py (the original template under jinja2).
+    const a = testing.allocator;
+    const tpl_z = try a.dupeSentinel(u8, @embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"), 0);
+    defer a.free(tpl_z);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("../../fixtures/nemo_speechlm_template_cases.json"), .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |case| {
+        const o = case.object;
+        const msgs = try std.json.Stringify.valueAlloc(a, o.get("messages").?, .{});
+        defer a.free(msgs);
+        const msgs_z = try a.dupeSentinel(u8, msgs, 0);
+        defer a.free(msgs_z);
+        const extra: [:0]const u8 = if (o.get("thinking").?.bool) "{}" else "{\"enable_thinking\":false}";
+        var len: usize = 0;
+        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, null, extra.ptr, 1, &len) orelse {
+            std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
+            return error.RenderFailed;
+        };
+        defer jinja_c.jinja_str_free(ptr);
+        testing.expectEqualStrings(o.get("expected").?.string, ptr[0..len]) catch |e| {
+            std.debug.print("case: {s}\n", .{o.get("label").?.string});
+            return e;
+        };
+    }
+}
+
 test "renderChatTemplate: REAL MiniCPM-V 4.7 chat_template.jinja renders without fallback (hermetic)" {
     const allocator = testing.allocator;
     var config = ChatConfig{

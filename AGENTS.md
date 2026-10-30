@@ -122,6 +122,7 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `prism_hadamard_qwen35` | `prism_hadamard_qwen35` | Bonsai 2: qwen3_5 behind block Hadamard rotations, f16 activations, exact 2-bit GEMVs |
 | `qwen4_exp(_text)` | `qwen4_exp` | Qwen3.8-Flash-Next: hyper-connections, n-gram PLE, QSA; batched text, exclusive MTP slot |
 | `nemotron_h`, `nemotron_h_puzzle`, `nemotron_h_omni` | `nemotron_h` | Transformer + Mamba2 hybrid, NoPE attention, RADIO vision, LiLiCorr DFlash, MTP sidecar |
+| `nemo_speechlm` | `nemotron_transcribe` | Nemotron 3.5 Transcribe: the Nemotron-H trunk (weights under `llm.`) + ASR and speaker encoders via `MediaHooks`; `/v1/audio/transcriptions` and chat `input_audio` |
 | `lfm2`, `lfm2_moe`, `lfm2_vl` (`lfm2-vl`) | `lfm2` | Gated conv + attention hybrid; SigLIP2 NaFlex tower with tiling |
 | `lfm3`, `lfm3_vl`, `lfm3_audio`, `lfm3_omni` | `lfm3` | Gated conv + full/sliding gated attention, sandwich norms, zero-tail partial RoPE; VL + speech towers via `MediaHooks`; speech OUT via `SpeechHooks` (OpenAI `modalities`, `/v1/audio/speech`) |
 | `laguna`, `kolibri1`, `flint` | same | Sliding + NoPE attention arms with sigmoid MoE and an UNGATED shared expert |

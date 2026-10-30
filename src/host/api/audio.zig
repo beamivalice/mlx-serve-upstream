@@ -79,6 +79,10 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "this model's transcription takes no 'prompt': send the language alone", 400);
         return;
     }
+    if (form.prompt != null and form.language != null and lm.config.?.isNemoSpeech()) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "this model's context recipe names no language: send 'prompt' or 'language', not both", 400);
+        return;
+    }
     const pcm = transcription_mod.decodeWav(allocator, form.file) catch |err| {
         log.warn("POST /v1/audio/transcriptions -> 400 (audio: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "`file` must be a WAV file (16- or 24-bit PCM, or 32-bit float)", 400);
@@ -182,7 +186,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const config = lm.config.?;
     const tok = lm.tokenizer.?;
     const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
-    var prompt_ids = if (config.speech() != null) try speechModelPrompt(allocator, stream, lm, form, &audio) else blk: {
+    var prompt_ids = if (config.speech() != null) try speechModelPrompt(allocator, stream, lm, form, &audio) else if (config.isNemoSpeech()) try nemoSpeechPrompt(allocator, stream, lm, form, &audio) else blk: {
         const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
         defer allocator.free(prompt_text);
         break :blk try encodeText(allocator, lm, tok, prompt_text, false);
@@ -311,6 +315,14 @@ fn speechModelPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedMod
         .{ .role = "system", .content = system },
         .{ .role = "user", .content = "", .audio = (audio)[0..1] },
     };
+    return cachedFormatChat(allocator, stream.io, lm, lm.tokenizer.?, lm.chat_config.?, &msgs, null, null, false, null, false);
+}
+
+/// Nemotron 3.5 Transcribe's card recipe as the user turn over the clip, thinking off (the template's `<think></think>`).
+fn nemoSpeechPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, form: transcription_mod.Form, audio: *const chat_mod.AudioData) ![]u32 {
+    const instruction = try transcription_mod.nemoPrompt(allocator, form.prompt, form.language);
+    defer allocator.free(instruction);
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = instruction, .audio = (audio)[0..1] }};
     return cachedFormatChat(allocator, stream.io, lm, lm.tokenizer.?, lm.chat_config.?, &msgs, null, null, false, null, false);
 }
 

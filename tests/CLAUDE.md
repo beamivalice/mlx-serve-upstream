@@ -150,6 +150,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_vision_chunked_prefill.sh` · `test_vision_prefix_cache.sh` · `test_multi_image_history.sh` · `test_decode_end_media_reuse.sh`
 - `test_embeddings.sh` /v1/embeddings · `test_transcriptions.sh` ASR + aligner + diarization
 - `test_lfm3.sh` **E** LFM3 text/VL/Audio/Omni: tools, images, speech out (chat audio, stream, TTS, ASR round trip)
+- `test_nemotron_transcribe.sh` **E** Nemotron 3.5 Transcribe: transcription, long clip, chat `input_audio`, translation, speaker tags
 
 **Media generation**
 - `test_unified_gen.sh` load/gen/unload · `test_gen_chat_interleave.sh` chat during media · `test_gen_chat_mix.sh` release battery
@@ -172,7 +173,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `MLX_SERVE_DIAG=vqmm-fn-ubench zig build test -Doptimize=ReleaseFast -Dtest-filter="Flash Next shapes µbench"` verify-lane prices
 
 **Converters, pack tools, calibration** (user-run; the header names inputs and the bar)
-- `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`
+- `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,nemotron_transcribe,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`
 - `fetch_convert_dsv4_0731.py`, `fetch_convert_minimax_h3_ref2va.py` disk-safe fetch+convert · `graft_qwen_image21_vision.py`
 - `requant_qwen4_pack.py`, `restandardize_qwen38_pack.py` repack in place · `verify_nemotron_lilicorr.py`
 - `test_convert_{minicpmv4_7,minimax_h3_omni,nemotron_lilicorr,qwen38_flash_next_bf16}.py` **H** converter checks (mlx or torch)

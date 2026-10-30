@@ -1226,6 +1226,11 @@ pub const ModelConfig = struct {
         return self.plugin_media and b.parsed.caps.audio;
     }
 
+    /// Nemotron 3.5 Transcribe: a Nemotron-H trunk whose plugin takes speech, told what to do by its user turn.
+    pub fn isNemoSpeech(self: *const ModelConfig) bool {
+        return self.pluginHears() and std.mem.eql(u8, self.model_type, "nemotron_h");
+    }
+
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }

@@ -166,7 +166,7 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,
         .audio = if (lm.vision_encoder) |ve| ve.supportsAudio() else false,
         // Transcription: Qwen3-ASR's tower, or a speech model's own (its card's ASR recipe, `handleTranscriptions`).
-        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null or (ve.supportsAudio() and lm.config.?.speech() != null) else false,
+        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null or (ve.supportsAudio() and (lm.config.?.speech() != null or lm.config.?.isNemoSpeech())) else false,
         .video = supportsVideo(lm),
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),

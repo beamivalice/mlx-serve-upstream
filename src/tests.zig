@@ -61,6 +61,7 @@ test {
     _ = @import("plugins/lfm2/proof_test.zig");
     _ = @import("plugins/lfm3/proof_test.zig");
     _ = @import("plugins/lfm3/served_test.zig");
+    _ = @import("plugins/nemotron_transcribe/proof_test.zig");
     _ = @import("plugins/qwen3/proof_test.zig");
     _ = @import("plugins/prism_hadamard_qwen35/proof_test.zig");
     _ = @import("plugins/mimo_v2/proof_test.zig");
